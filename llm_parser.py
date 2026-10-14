@@ -478,6 +478,8 @@ def interpret_schedule(history: list[dict], summary: str) -> dict:
         "reply 里说到现在的设置时，必须照下面给出的当前规则，不要把默认值说成正在执行的规则。\n"
         "只有用户明确要添加或修改时，才填写对应 action。reply 里的说法必须和 action 一致，不要说暂停却填 default。不要说已经保存。页面会再让用户确认。\n"
         "用户要马上审核、马上拉取、立刻收信或让新邮箱马上看一遍时，poll_action 填 now。这是现在收一次未读，之后的节奏不变。不要理解成等邮箱服务商审核，也不要因此改成 paused 或 default。\n"
+        "当前规则是暂停时，用户说继续拉取、恢复拉取、开始拉取，poll_action 必须填 default。这时不要填 keep，也不要回复已经在拉取。\n"
+        "更早的对话如果和当前规则不一致，以当前规则为准，不要跟着旧回复说。\n"
         "没有提到的项目保持不变，动作填 keep。用户明确说恢复默认时，把提到的项目设为 default。\n"
         f"当前规则：{summary}\n"
         f"默认拉取：每 {os.getenv('MAIL_POLL_MINUTES', '5')} 分钟。\n"

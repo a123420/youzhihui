@@ -158,6 +158,15 @@ def init_db() -> None:
             )
             """
         )
+        box_columns = {row[1] for row in conn.execute("PRAGMA table_info(mailbox)")}
+        if "history_done" not in box_columns:
+            conn.execute("ALTER TABLE mailbox ADD COLUMN history_done INTEGER DEFAULT 0")
+            conn.execute(
+                """
+                UPDATE mailbox SET history_done=1
+                 WHERE id IN (SELECT DISTINCT mailbox_id FROM mail_info)
+                """
+            )
         _import_env_mailbox(conn)
 
 
@@ -243,7 +252,7 @@ def mailbox_accounts() -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, address, password, label, imap_host, imap_port,
-                   smtp_host, smtp_port, smtp_mode
+                   smtp_host, smtp_port, smtp_mode, history_done
               FROM mailbox
              ORDER BY id
             """
@@ -501,6 +510,12 @@ def set_mail_usefulness(mail_id: int, usefulness: str) -> bool:
         return cur.rowcount == 1
 
 
+def mark_history_done(mailbox_id: int) -> None:
+    """新邮箱第一次补拉最近邮件做完了，以后只收未读。"""
+    with get_conn() as conn:
+        conn.execute("UPDATE mailbox SET history_done=1 WHERE id=?", (mailbox_id,))
+
+
 def delete_mail(mail_id: int) -> bool:
     """删掉一封邮件，以及由它生成的任务。"""
     with get_conn() as conn:
@@ -511,9 +526,33 @@ def delete_mail(mail_id: int) -> bool:
 
 def delete_all_stored() -> tuple[int, int]:
     """清空已入库邮件和任务。规则和对话保留。"""
+    return delete_mails_by_usefulness("all")
+
+
+def delete_mails_by_usefulness(kind: str) -> tuple[int, int]:
+    """按分类删除已入库邮件。全部时连任务一起清掉。"""
+    if kind == "all":
+        with get_conn() as conn:
+            tasks = conn.execute("DELETE FROM customer_task").rowcount
+            mails = conn.execute("DELETE FROM mail_info").rowcount
+        return mails, tasks
+    if kind not in {"useful", "ordinary", "spam"}:
+        raise ValueError("分类无效")
     with get_conn() as conn:
-        tasks = conn.execute("DELETE FROM customer_task").rowcount
-        mails = conn.execute("DELETE FROM mail_info").rowcount
+        ids = [row["id"] for row in conn.execute("SELECT id FROM mail_info WHERE usefulness=?", (kind,))]
+        tasks = 0
+        mails = 0
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            tasks += conn.execute(
+                f"DELETE FROM customer_task WHERE source_mail_id IN ({marks})",
+                chunk,
+            ).rowcount
+            mails += conn.execute(
+                f"DELETE FROM mail_info WHERE id IN ({marks})",
+                chunk,
+            ).rowcount
     return mails, tasks
 
 

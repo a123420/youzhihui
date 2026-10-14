@@ -38,6 +38,7 @@ from db_init import (
     insert_mail,
     list_due_tasks,
     list_mails_need_parse,
+    mailbox_accounts,
     list_unsent_due,
     mark_unsent_due,
     now_str,
@@ -48,7 +49,7 @@ from db_init import (
     update_mail_parse,
 )
 from llm_parser import DISCLAIMER, DeepSeekUnreachable, generate_daily_report, generate_summary, parse_email
-from mail_client import fetch_unseen_mails, mark_seen
+from mail_client import fetch_recent_mails, fetch_unseen_mails, mark_seen
 from operator_rule import current_rule, describe_rule, is_default_rule, reply_mode, save_operator_rule
 from push_notify import (
     notify_daily,
@@ -418,8 +419,92 @@ def _poll_entry() -> None:
             reschedule_from_rule(immediate=False)
 
 
+_history_lock = threading.Lock()
+
+
+def _pull_history(account: dict, failures: dict) -> int:
+    """新接入的邮箱先收最近 40 封（含已读），时间用邮箱里原来的时间。只做一次。"""
+    global _scan_note
+    from db_init import mark_history_done
+
+    box_id = int(account.get("id") or 0)
+    if not box_id or should_stop():
+        return 0
+    with _history_lock:
+        fresh = next((a for a in mailbox_accounts() if int(a.get("id") or 0) == box_id), None)
+        if not fresh or fresh.get("history_done"):
+            return 0
+        label = str(account.get("address") or "")
+        _scan_note = f"正在收 {label} 最近的邮件" if label else "正在收新邮箱最近的邮件"
+        try:
+            older = fetch_recent_mails(limit=40, account=account, failures=failures)
+        except Exception as exc:
+            logger.exception("新邮箱首次收信失败，下一轮再试")
+            notify_error("新邮箱首次收信", exc)
+            if _scan_note.startswith("正在"):
+                _scan_note = "首次收信中断，下一轮会继续"
+            return 0
+        seen_uids = []
+        for mail in older:
+            if should_stop():
+                return 0
+            try:
+                ingest_mail(mail)
+                seen_uids.append(mail["uid"])
+            except Exception as exc:
+                uid = str(mail.get("uid") or "")
+                failures[uid] = failures.get(uid, 0) + 1
+                logger.exception("邮件入库失败 uid=%s", uid)
+                notify_error("邮件入库", exc)
+        if seen_uids:
+            try:
+                mark_seen(seen_uids, account)
+            except Exception as exc:
+                logger.exception("标记已读失败")
+                notify_error("标记已读", exc)
+        if older and not seen_uids:
+            logger.warning("新邮箱首次收信一封都没存进去，下一轮再试")
+            return 0
+        mark_history_done(box_id)
+        logger.info("新邮箱 id=%s 首次收信入库 %s 封", box_id, len(seen_uids))
+        return len(seen_uids)
+
+
+def scan_new_mailboxes() -> None:
+    """刚保存的邮箱马上收一次最近邮件并解析，不等下一轮拉取。暂停拉取时也照做，只这一次。"""
+    global _scan_note
+    pulled = 0
+    for account in mailbox_accounts():
+        if should_stop():
+            return
+        if account.get("history_done"):
+            continue
+        failures = _fetch_failures.setdefault(int(account.get("id") or 0), {})
+        pulled += _pull_history(account, failures)
+    if pulled and not should_stop():
+        parsed = _parse_backlog()
+        _scan_note = f"新邮箱已收 {pulled} 封" + (f"，并解析 {parsed} 封" if parsed else "")
+
+
+def first_scan_soon() -> None:
+    """调度器已经在跑时，排一次新邮箱首次收信。还没启动的，启动后的第一轮拉取会先做。"""
+    if _scheduler is None or should_stop():
+        return
+    if not any(not a.get("history_done") for a in mailbox_accounts()):
+        return
+    _scheduler.add_job(
+        lambda: _guard("新邮箱首次收信", scan_new_mailboxes),
+        "date",
+        run_date=datetime.now(CST),
+        id="first_scan",
+        max_instances=1,
+        misfire_grace_time=120,
+        replace_existing=True,
+    )
+
+
 def job_poll_mail() -> None:
-    """每个已接入的邮箱各扫各的。扫完一批再看，还有未读才扫下一批。"""
+    """每个已接入的邮箱各扫各的。新邮箱先收最近 40 封，再扫未读；扫完一批再看，还有未读才扫下一批。"""
     global _scan_note
     from db_init import mailbox_accounts
     from operator_rule import active_fetch_limit
@@ -435,6 +520,11 @@ def job_poll_mail() -> None:
                 break
             label = str(account.get("address") or "")
             failures = _fetch_failures.setdefault(int(account.get("id") or 0), {})
+            if not account.get("history_done"):
+                got = _pull_history(account, failures)
+                if got:
+                    batches += 1
+                    pulled += got
             rounds = 0
             while pulled < ceiling and not should_stop() and rounds < 40:
                 rounds += 1

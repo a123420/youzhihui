@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import smtplib
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email import policy
@@ -188,8 +189,23 @@ def _rfc822(fetched) -> bytes:
     return b""
 
 
-def _received_at(message) -> str:
-    raw = message.get("Date")
+def _internal_date(fetched) -> str:
+    for part in fetched or []:
+        meta = part[0] if isinstance(part, tuple) else part
+        if not isinstance(meta, (bytes, bytearray)):
+            continue
+        stamp = imaplib.Internaldate2tuple(bytes(meta))
+        if stamp:
+            return datetime.fromtimestamp(time.mktime(stamp), CST).strftime("%Y-%m-%d %H:%M:%S")
+    return ""
+
+
+def _received_at(message, fallback: str = "") -> str:
+    """邮件自带的 Date 优先；有些通知信没有 Date，就用邮箱服务器记的收信时间。"""
+    try:
+        raw = message.get("Date")
+    except Exception:
+        raw = None
     if raw:
         try:
             moment = parsedate_to_datetime(str(raw))
@@ -197,11 +213,14 @@ def _received_at(message) -> str:
                 moment = moment.replace(tzinfo=CST)
             return moment.astimezone(CST).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
-            logger.warning("邮件时间无法解析，改用当前时间")
+            logger.warning("邮件时间无法解析，改用服务器收信时间")
+    if fallback:
+        return fallback
+    logger.warning("邮件没有时间，改用当前时间")
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _build_mail(uid: str, raw: bytes) -> dict:
+def _build_mail(uid: str, raw: bytes, internal_date: str = "") -> dict:
     message = email.message_from_bytes(raw, policy=policy.default)
     subject = _header(message, "Subject") or "(无主题)"
     name, address = parseaddr(message.get("From") or "")
@@ -261,7 +280,7 @@ def _build_mail(uid: str, raw: bytes) -> dict:
         "sender": sender[:300],
         "sender_email": address[:200],
         "content": content,
-        "received_at": _received_at(message),
+        "received_at": _received_at(message, internal_date),
     }
 
 
@@ -276,6 +295,68 @@ def _default_name(content_type: str) -> str:
 SKIP_AFTER = 3
 
 
+def _search_uids(client, criterion: str) -> list[str]:
+    status, data = client.uid("SEARCH", None, criterion)
+    if status != "OK" or not data or not data[0]:
+        return []
+    return [
+        uid.decode("ascii", errors="ignore") if isinstance(uid, bytes) else str(uid)
+        for uid in data[0].split()
+        if uid
+    ]
+
+
+def _fetch_selected(
+    criterion: str,
+    limit: int,
+    account: dict | None,
+    failures: dict,
+    newest: bool,
+    empty_note: str,
+    found_note: str,
+) -> list[dict]:
+    """先按条件选出邮件，断开连接后再解析正文。"""
+    raw_mails = []
+    with _imap_session(account) as client:
+        all_uids = _search_uids(client, criterion)
+        if not all_uids:
+            logger.info(empty_note)
+            return []
+        pending = [uid for uid in all_uids if failures.get(uid, 0) < SKIP_AFTER]
+        uids = (pending[-limit:] if newest else pending[:limit])
+        logger.info(found_note, len(all_uids), len(uids))
+        for uid_text in uids:
+            try:
+                status, fetched = client.uid("FETCH", uid_text, "(INTERNALDATE BODY.PEEK[])")
+                if status != "OK":
+                    logger.error("读取邮件失败 uid=%s status=%s", uid_text, status)
+                    failures[uid_text] = failures.get(uid_text, 0) + 1
+                    continue
+                raw = _rfc822(fetched)
+                if not raw:
+                    logger.error("邮件正文为空 uid=%s", uid_text)
+                    failures[uid_text] = failures.get(uid_text, 0) + 1
+                    continue
+                raw_mails.append((uid_text, raw, _internal_date(fetched)))
+            except Exception:
+                logger.exception("读取邮件失败 uid=%s，本封跳过", uid_text)
+                failures[uid_text] = failures.get(uid_text, 0) + 1
+
+    mails = []
+    for uid_text, raw, internal_date in raw_mails:
+        try:
+            mails.append(_build_mail(uid_text, raw, internal_date))
+        except Exception:
+            logger.exception("解析邮件失败 uid=%s，本封跳过", uid_text)
+            failures[uid_text] = failures.get(uid_text, 0) + 1
+    mailbox_id = int(account.get("id") or 0) if account else 0
+    address = str(account.get("address") or "") if account else ""
+    for mail in mails:
+        mail["mailbox_id"] = mailbox_id
+        mail["account"] = address
+    return mails
+
+
 def fetch_unseen_mails(
     limit: int | None = None,
     account: dict | None = None,
@@ -288,51 +369,36 @@ def fetch_unseen_mails(
     """
     if limit is None:
         limit = max(1, min(_int_env("MAIL_FETCH_LIMIT", 40), 80))
-    limit = max(1, limit)
     if failures is None:
         failures = {}
-    raw_mails = []
-    with _imap_session(account) as client:
-        status, data = client.uid("SEARCH", None, "UNSEEN")
-        if status != "OK" or not data or not data[0]:
-            logger.info("收件箱没有未读邮件")
-            return []
-        all_uids = [
-            uid.decode("ascii", errors="ignore") if isinstance(uid, bytes) else str(uid)
-            for uid in data[0].split()
-        ]
-        uids = [uid for uid in all_uids if failures.get(uid, 0) < SKIP_AFTER][:limit]
-        logger.info("收件箱未读 %s 封，本轮处理 %s 封", len(all_uids), len(uids))
-        for uid_text in uids:
-            try:
-                status, fetched = client.uid("FETCH", uid_text, "(BODY.PEEK[])")
-                if status != "OK":
-                    logger.error("读取邮件失败 uid=%s status=%s", uid_text, status)
-                    failures[uid_text] = failures.get(uid_text, 0) + 1
-                    continue
-                raw = _rfc822(fetched)
-                if not raw:
-                    logger.error("邮件正文为空 uid=%s", uid_text)
-                    failures[uid_text] = failures.get(uid_text, 0) + 1
-                    continue
-                raw_mails.append((uid_text, raw))
-            except Exception:
-                logger.exception("读取邮件失败 uid=%s，本封跳过", uid_text)
-                failures[uid_text] = failures.get(uid_text, 0) + 1
+    return _fetch_selected(
+        "UNSEEN",
+        max(1, limit),
+        account,
+        failures,
+        False,
+        "收件箱没有未读邮件",
+        "收件箱未读 %s 封，本轮处理 %s 封",
+    )
 
-    mails = []
-    for uid_text, raw in raw_mails:
-        try:
-            mails.append(_build_mail(uid_text, raw))
-        except Exception:
-            logger.exception("解析邮件失败 uid=%s，本封跳过", uid_text)
-            failures[uid_text] = failures.get(uid_text, 0) + 1
-    mailbox_id = int(account.get("id") or 0) if account else 0
-    address = str(account.get("address") or "") if account else ""
-    for mail in mails:
-        mail["mailbox_id"] = mailbox_id
-        mail["account"] = address
-    return mails
+
+def fetch_recent_mails(
+    limit: int = 40,
+    account: dict | None = None,
+    failures: dict | None = None,
+) -> list[dict]:
+    """补拉最近邮件，包含已经读过的。只在这个邮箱还没有入库记录时用。"""
+    if failures is None:
+        failures = {}
+    return _fetch_selected(
+        "ALL",
+        max(1, min(limit, 40)),
+        account,
+        failures,
+        True,
+        "收件箱是空的",
+        "收件箱共 %s 封，补拉最近 %s 封",
+    )
 
 
 def mark_seen(uids: list[str], account: dict | None = None) -> None:

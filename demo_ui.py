@@ -16,8 +16,8 @@ from configure import _read_env, apply_ui_config, detect_mailbox, sync_after_mai
 from db_init import (
     complete_task,
     dashboard_snapshot,
-    delete_all_stored,
     delete_mail,
+    delete_mails_by_usefulness,
     delete_mailbox,
     delete_task,
     get_task,
@@ -379,10 +379,16 @@ class DemoHandler(BaseHTTPRequestHandler):
             self._json(200, build_state())
             return
         if path == "/api/mail/delete-all":
-            if payload.get("confirm") != "删除全部":
+            kind = str(payload.get("kind") or "all")
+            expected = {"all": "删除全部", "useful": "删除有用", "ordinary": "删除普通", "spam": "删除垃圾"}
+            if kind not in expected or payload.get("confirm") != expected[kind]:
                 self._json(400, {"error": "请先确认再删除"})
                 return
-            delete_all_stored()
+            try:
+                delete_mails_by_usefulness(kind)
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
             self._json(200, build_state())
             return
         if path == "/api/task/done":
@@ -481,6 +487,9 @@ class DemoHandler(BaseHTTPRequestHandler):
             return
         if _Bridge.on_saved:
             _Bridge.on_saved()
+        from scheduler_task import first_scan_soon
+
+        first_scan_soon()
         self._json(200, {"ok": True})
 
     def _read_raw(self) -> bytes | None:
@@ -730,13 +739,14 @@ PAGE = """<!DOCTYPE html>
   .msg.ok { color: var(--teal-deep); }
   .example { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--line); }
   .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
-  .filters { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+  .filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 10px; }
   button.chip {
     background: #f7f4ee; color: var(--ink); border: 1px solid var(--line);
     padding: 6px 10px; font-size: 13px; font-weight: 600;
   }
   button.chip:hover { background: #eef8f6; color: var(--teal-deep); }
   button.chip.active, button.chip.active:hover { background: var(--teal); color: white; border-color: var(--teal); }
+  #wipeMails { margin-left: auto; }
   .detect { margin: 8px 0 0; min-height: 1.2em; color: var(--teal-deep); font-size: 13px; }
   button.more { margin-top: 4px; background: transparent; color: var(--teal-deep); border: 1px solid var(--line); }
   button.more:hover { background: #eef8f6; }
@@ -955,7 +965,6 @@ PAGE = """<!DOCTYPE html>
             <div class="lane-head"><h2>最近邮件</h2></div>
             <div class="lane-tools">
               <input id="mailSearch" type="text" placeholder="搜索全部已入库邮件" />
-              <button class="textbtn" type="button" id="wipeMails">一键删除</button>
             </div>
             <div class="lane-tools">
               <input id="backupStart" type="date" aria-label="导出开始日期" />
@@ -970,6 +979,7 @@ PAGE = """<!DOCTYPE html>
               <button class="chip" type="button" data-filter="useful">有用</button>
               <button class="chip" type="button" data-filter="ordinary">普通</button>
               <button class="chip" type="button" data-filter="spam">垃圾</button>
+              <button class="textbtn" type="button" id="wipeMails">一键删除</button>
             </div>
             <div id="mails" class="lane-body"></div>
           </section>
@@ -1226,7 +1236,8 @@ function miniButton(label, className, onClick) {
 function renderWipeBar() {
   const bar = document.getElementById("wipeBar");
   if (!bar) return;
-  const sig = pendingWipe ? "on" : "off";
+  const kind = mailFilter || "all";
+  const sig = pendingWipe ? kind : "off";
   if (bar.dataset.sig === sig) return;
   bar.dataset.sig = sig;
   bar.replaceChildren();
@@ -1234,14 +1245,21 @@ function renderWipeBar() {
     bar.hidden = true;
     return;
   }
+  const words = {
+    all: ["删除全部", "确定删除全部已入库邮件和任务？不能恢复。", "已删除全部邮件和任务"],
+    useful: ["删除有用", "确定删除所有「有用」邮件？相关任务一并删除，不能恢复。", "已删除有用邮件"],
+    ordinary: ["删除普通", "确定删除所有「普通」邮件？相关任务一并删除，不能恢复。", "已删除普通邮件"],
+    spam: ["删除垃圾", "确定删除所有「垃圾」邮件？相关任务一并删除，不能恢复。", "已删除垃圾邮件"]
+  };
+  const chosen = words[kind] || words.all;
   bar.hidden = false;
   bar.className = "wipebar";
-  bar.appendChild(node("span", "", "确定删除全部已入库邮件和任务？不能恢复。"));
+  bar.appendChild(node("span", "", chosen[1]));
   bar.appendChild(miniButton("确定删除", "danger", async () => {
     pendingWipe = false;
     try {
-      const data = await postJson("/api/mail/delete-all", {confirm: "删除全部"});
-      showAct("已删除全部邮件和任务");
+      const data = await postJson("/api/mail/delete-all", {confirm: chosen[0], kind: kind});
+      showAct(chosen[2]);
       applyState(data);
     } catch (err) {
       showAct(err.message, true);
@@ -1939,6 +1957,7 @@ function bindFilter(boxId, apply) {
 bindFilter("mailFilters", (value) => {
   mailFilter = value;
   shownLimit.mails = 30;
+  renderWipeBar();
   renderBoardMails();
 });
 bindFilter("dayFilters", (value) => {

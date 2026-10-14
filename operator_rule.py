@@ -255,6 +255,31 @@ def pending_summary() -> str:
     return str(_pending_rule.get("summary") or "")
 
 
+def _resume_requested(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return any(word in compact for word in ("继续拉取", "恢复拉取", "开始拉取", "继续收信", "恢复收信"))
+
+
+def _direct_schedule(text: str, rule: dict) -> dict | None:
+    """说法明确时直接定规则，不再让模型把当前状态说反。"""
+    compact = re.sub(r"\s+", "", text or "")
+    base = {"reply_action": "keep", "report_action": "keep", "poll_minutes": 0, "poll_time": "", "reply": ""}
+    if any(word in compact for word in ("暂停拉取", "停止拉取", "先暂停", "先别拉")):
+        if (rule.get("poll_mode") or "default") == "paused":
+            return {**base, "poll_action": "keep", "reply": "现在已经暂停拉取，不用再改。"}
+        return {**base, "poll_action": "paused"}
+    if any(word in compact for word in ("马上拉取", "马上审核", "马上收", "立刻收", "立即收")):
+        return {**base, "poll_action": "now"}
+    minutes = re.search(r"每(\d{1,4})分钟", compact)
+    if minutes and any(word in compact for word in ("拉取", "收信", "检查")):
+        return {**base, "poll_action": "interval", "poll_minutes": int(minutes.group(1))}
+    if _resume_requested(text) and "分钟" not in compact:
+        if (rule.get("poll_mode") or "default") == "paused":
+            return {**base, "poll_action": "default"}
+        return {**base, "poll_action": "keep", "reply": "现在已经在按这个节奏收取：" + describe_rule(rule)}
+    return None
+
+
 def ask_for_advice(text: str) -> str:
     """问建议或草拟规则。规则先停在待确认，点确认后才保存。"""
     global _pending_rule, _pending_fetch
@@ -269,8 +294,17 @@ def ask_for_advice(text: str) -> str:
     try:
         from llm_parser import interpret_schedule
 
-        parsed = interpret_schedule(list_chat(8), before["summary"])
+        direct = _direct_schedule(message, before)
+        parsed = direct if direct is not None else interpret_schedule(list_chat(8), before["summary"])
         fetch_now = str(parsed.get("poll_action") or "").strip().lower() == "now"
+        if (
+            before.get("poll_mode") == "paused"
+            and _resume_requested(message)
+            and str(parsed.get("poll_action") or "").strip().lower() in {"", "keep", "paused"}
+        ):
+            parsed = dict(parsed)
+            parsed["poll_action"] = "default"
+            fetch_now = False
         if fetch_now:
             parsed = dict(parsed)
             parsed["poll_action"] = "keep"
