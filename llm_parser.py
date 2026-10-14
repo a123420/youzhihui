@@ -475,7 +475,9 @@ def interpret_schedule(history: list[dict], summary: str) -> dict:
     system = (
         "你是邮智汇的调度助手。用户可能在问建议，也可能在要求添加或修改规则。\n"
         "如果用户是在问建议、问现在好不好、没有明确要求修改，所有 action 保持 keep，把建议写在 reply，不要改规则。\n"
-        "只有用户明确要添加或修改时，才填写对应 action。reply 说明将要改成什么，不要说已经保存。页面会再让用户确认。\n"
+        "reply 里说到现在的设置时，必须照下面给出的当前规则，不要把默认值说成正在执行的规则。\n"
+        "只有用户明确要添加或修改时，才填写对应 action。reply 里的说法必须和 action 一致，不要说暂停却填 default。不要说已经保存。页面会再让用户确认。\n"
+        "用户要马上审核、马上拉取、立刻收信或让新邮箱马上看一遍时，poll_action 填 now。这是现在收一次未读，之后的节奏不变。不要理解成等邮箱服务商审核，也不要因此改成 paused 或 default。\n"
         "没有提到的项目保持不变，动作填 keep。用户明确说恢复默认时，把提到的项目设为 default。\n"
         f"当前规则：{summary}\n"
         f"默认拉取：每 {os.getenv('MAIL_POLL_MINUTES', '5')} 分钟。\n"
@@ -484,7 +486,8 @@ def interpret_schedule(history: list[dict], summary: str) -> dict:
         "只输出一个 JSON 对象，不要其他文字。字段如下：\n"
         '{"reply":"一两句中文。问建议时只给建议；要改规则时说明将要改成什么，不要说已经保存","poll_action":"keep","poll_minutes":0,'
         '"poll_time":"","reply_action":"keep","report_action":"keep","report_time":""}\n'
-        "poll_action 只能是 keep、default、interval、daily、paused、once。\n"
+        "poll_action 只能是 keep、default、interval、daily、paused、once、now。\n"
+        "now 表示马上收一次，不修改之后的拉取节奏，poll_minutes 和 poll_time 留空。\n"
         "interval 时 poll_minutes 取 1 到 1440。\n"
         "daily 时 poll_time 用 24 小时制 HH:MM，表示每天这个时间拉取。\n"
         "once 时 poll_time 用 YYYY-MM-DD HH:MM，表示只在这个时间拉取一次，之后恢复默认拉取。\n"

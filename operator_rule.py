@@ -238,6 +238,7 @@ def _apply_saved(rule: dict) -> None:
 
 
 _pending_rule: dict | None = None
+_pending_fetch = False
 
 _RULE_KEYS = ("poll_mode", "poll_minutes", "poll_time", "reply_mode", "report_mode", "report_time", "fetch_limit")
 
@@ -247,6 +248,8 @@ def _same_rule(left: dict, right: dict) -> bool:
 
 
 def pending_summary() -> str:
+    if _pending_fetch and (_pending_rule is None or _same_rule(_pending_rule, current_rule())):
+        return "马上收取一次未读邮件。之后的拉取节奏不变。"
     if not _pending_rule:
         return ""
     return str(_pending_rule.get("summary") or "")
@@ -254,7 +257,7 @@ def pending_summary() -> str:
 
 def ask_for_advice(text: str) -> str:
     """问建议或草拟规则。规则先停在待确认，点确认后才保存。"""
-    global _pending_rule
+    global _pending_rule, _pending_fetch
     message = (text or "").strip()
     if not message:
         raise ValueError("请先写一句建议或要添加的规则")
@@ -267,17 +270,30 @@ def ask_for_advice(text: str) -> str:
         from llm_parser import interpret_schedule
 
         parsed = interpret_schedule(list_chat(8), before["summary"])
+        fetch_now = str(parsed.get("poll_action") or "").strip().lower() == "now"
+        if fetch_now:
+            parsed = dict(parsed)
+            parsed["poll_action"] = "keep"
         rule = merge_rule(before, parsed)
         reply = str(parsed.get("reply") or "").strip()
-        if _same_rule(before, rule):
+        changed = not _same_rule(before, rule)
+        if not changed and not fetch_now:
             _pending_rule = None
+            _pending_fetch = False
             reply = reply or "这是建议，当前规则没有改动。"
         else:
             _pending_rule = rule
-            reply = (reply or rule["summary"]) + "\n还没保存。确认添加后才会按这条执行。"
+            _pending_fetch = fetch_now
+            lines = []
+            if changed:
+                lines.append("将改成：" + rule["summary"])
+            if fetch_now:
+                lines.append("将马上收取一次未读邮件，之后仍按现在的节奏。")
+            reply = "\n".join(lines) + "\n还没执行。确认后才会按这句做。"
     except Exception as exc:
         logger.exception("调度对话没有生成建议")
         _pending_rule = None
+        _pending_fetch = False
         reply = f"这条没有生成，仍按原来的规则。{exc}"[:500]
     add_chat("assistant", reply)
     return reply
@@ -285,35 +301,53 @@ def ask_for_advice(text: str) -> str:
 
 def confirm_pending(accept: bool) -> str:
     """确认后才写入规则。取消则丢掉这次建议。"""
-    global _pending_rule
+    global _pending_rule, _pending_fetch
     init_db()
-    if not _pending_rule:
+    if not _pending_rule and not _pending_fetch:
         raise ValueError("没有待确认的规则")
     if not accept:
         _pending_rule = None
+        _pending_fetch = False
         reply = "已取消，规则保持原样。"
         add_chat("assistant", reply)
         return reply
     rule = _pending_rule
+    fetch_now = _pending_fetch
     _pending_rule = None
-    _apply_saved(rule)
-    reply = f"已确认并保存。{rule['summary']}"
+    _pending_fetch = False
+    changed = bool(rule) and not _same_rule(current_rule(), rule)
+    if changed:
+        _apply_saved(rule)
+    if fetch_now:
+        import threading
+
+        from scheduler_task import job_poll_mail
+
+        threading.Thread(target=job_poll_mail, daemon=True, name="poll-once").start()
+    if changed and fetch_now:
+        reply = f"已确认并保存。{rule['summary']} 同时开始收取一次未读邮件。"
+    elif fetch_now:
+        reply = "已确认。开始收取一次未读邮件，之后的节奏不变。"
+    else:
+        reply = f"已确认并保存。{rule['summary']}"
     add_chat("assistant", reply)
     return reply
 
 
 def clear_conversation() -> int:
     """清掉调度对话。待确认的建议一并丢掉，已经保存的规则不动。"""
-    global _pending_rule
+    global _pending_rule, _pending_fetch
     init_db()
     _pending_rule = None
+    _pending_fetch = False
     return clear_chat()
 
 
 def restore_default() -> str:
-    global _pending_rule
+    global _pending_rule, _pending_fetch
     init_db()
     _pending_rule = None
+    _pending_fetch = False
     rule = blank_rule()
     rule["summary"] = describe_rule(rule)
     _apply_saved(rule)
