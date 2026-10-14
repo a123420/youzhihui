@@ -29,19 +29,24 @@ from db_init import (
     claim_task,
     fail_task,
     finish_task,
+    count_imported_older,
+    count_recent_mails,
     get_conn,
     get_mail,
     get_task,
+    history_uids,
     save_task_draft,
     init_db,
     insert_customer_task,
     insert_mail,
     list_due_tasks,
     list_mails_need_parse,
+    mail_from_history,
     mailbox_accounts,
     list_unsent_due,
     mark_unsent_due,
     now_str,
+    query_imported_older,
     query_mails_between,
     query_recent_mails,
     query_tasks_between,
@@ -109,7 +114,33 @@ def _apply_day_period(raw: str, hour: int) -> int:
     return hour
 
 
-def normalize_execute_time(text: str) -> str:
+def _anchor_date(received_at: str):
+    """邮件原来的日期。没有日期时返回空。"""
+    if received_at and len(received_at) >= 10:
+        try:
+            return datetime.strptime(received_at[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def _run_now(text: str) -> bool:
+    raw = (text or "").strip()
+    return raw == "现在" or any(word in raw for word in ("立即", "马上", "即刻", "立刻"))
+
+
+def _status_for_time(execute_at: str, run_now: bool = False) -> str:
+    """已经过去的时间留给人确认。明确说立即执行的，仍然马上排队。"""
+    if run_now and execute_at:
+        return "pending"
+    if not execute_at:
+        return "need_time"
+    if execute_at <= datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"):
+        return "need_time"
+    return "pending"
+
+
+def normalize_execute_time(text: str, received_at: str = "") -> str:
     """把客户要求的执行时间尽量收成 YYYY-MM-DD HH:MM:SS。无法识别时返回空字符串。"""
     if text is None:
         return ""
@@ -160,15 +191,16 @@ def normalize_execute_time(text: str) -> str:
     clock = re.search(r"(\d{1,2})\s*[:点时]\s*(\d{1,2})?", raw)
     if not clock:
         return ""
-    base = datetime.now(CST).replace(tzinfo=None)
+    anchor = _anchor_date(received_at) or datetime.now(CST).replace(tzinfo=None).date()
     if has_tomorrow:
-        base += timedelta(days=1)
+        anchor += timedelta(days=1)
     try:
-        moment = base.replace(
-            hour=_apply_day_period(raw, int(clock.group(1))),
-            minute=int(clock.group(2) or 0),
-            second=0,
-            microsecond=0,
+        moment = datetime(
+            anchor.year,
+            anchor.month,
+            anchor.day,
+            _apply_day_period(raw, int(clock.group(1))),
+            int(clock.group(2) or 0),
         )
     except ValueError:
         return ""
@@ -209,20 +241,24 @@ def reminder_execute_at(subject: str, content: str, todo: str, received_at: str)
     if hour > 23:
         return ""
     today = datetime.now(CST).replace(tzinfo=None).date()
-    received_day = None
-    if received_at and len(received_at) >= 10:
-        try:
-            received_day = datetime.strptime(received_at[:10], "%Y-%m-%d").date()
-        except ValueError:
-            received_day = None
+    anchor = _anchor_date(received_at) or today
     day_mark = re.search(r"(?<!\d)(\d{1,2})\s*号", text)
     if day_mark:
-        day = _date_with_day(today, int(day_mark.group(1)))
-        if day is None:
-            return ""
+        number = int(day_mark.group(1))
+        if anchor < today:
+            try:
+                day = datetime(anchor.year, anchor.month, number).date()
+            except ValueError:
+                return ""
+        else:
+            day = _date_with_day(today, number)
+            if day is None:
+                return ""
     elif "明天" in text:
-        day = today + timedelta(days=1)
-    elif any(word in text for word in ("今天", "今日", "今晚")) or received_day == today:
+        day = anchor + timedelta(days=1)
+    elif any(word in text for word in ("今天", "今日", "今晚")):
+        day = anchor
+    elif anchor == today:
         day = today
     else:
         return ""
@@ -244,26 +280,16 @@ def _looks_like_email(address: str) -> bool:
     return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address or ""))
 
 
+_REPLY_PREFIX = re.compile(r"(回复|答复|re|fw|fwd)\s*[:：]", re.IGNORECASE)
+_REPLY_NEGATE = re.compile(r"(请勿|无需|不用|不要|勿|禁止|不必)\s*(回复|回邮|发邮件|发送邮件|邮件回复)")
+
+
 def asks_for_reply(text: str) -> bool:
-    lowered = (text or "").lower()
+    """主题里原有的「回复：」和「请勿回复」都不算客户要求回信。"""
+    cleaned = _REPLY_NEGATE.sub(" ", text or "")
+    cleaned = _REPLY_PREFIX.sub(" ", cleaned)
+    lowered = cleaned.lower()
     return any(hint in lowered for hint in REPLY_HINTS)
-
-
-_SUMMARY_HINT = re.compile(r"汇总|总结|整理|统计|报告|周报|日报|月报|summary|report", re.IGNORECASE)
-
-
-def _quick_reply(text: str, sender: str, summary_task: bool = False) -> bool:
-    """来了就能直接写回复的。客户汇总任务要先汇总再回，等到点生成汇总后再出草稿。"""
-    if reply_mode() == "never":
-        return False
-    if summary_task and _SUMMARY_HINT.search(text or ""):
-        return False
-    return asks_for_reply(text) and _looks_like_email(sender)
-
-
-def _local_reply(action: str) -> str:
-    title = " ".join((action or "这封来信").split())[:80]
-    return f"关于「{title}」，回复如下：\n\n"
 
 
 def _should_reply(next_action: str, reply_to: str) -> bool:
@@ -311,7 +337,7 @@ def parse_saved_mail(mail_id: int) -> None:
         raw_json = json.dumps(parsed, ensure_ascii=False)
 
     if parsed["type"] == "customer_task":
-        execute_at = normalize_execute_time(parsed["execute_time"])
+        execute_at = normalize_execute_time(parsed["execute_time"], row.get("received_at") or "")
         reply_text = " ".join(
             [
                 parsed.get("next_action") or "",
@@ -320,22 +346,22 @@ def parse_saved_mail(mail_id: int) -> None:
                 parsed.get("output_format") or "",
             ]
         )
-        as_reply = _quick_reply(reply_text, row["sender_email"], summary_task=True)
+        sender = row["sender_email"]
+        wants_reply = reply_mode() != "never" and _looks_like_email(sender) and (
+            reply_mode() == "always" or asks_for_reply(reply_text)
+        )
         task = insert_customer_task(
             customer_name=parsed["customer_name"],
             execute_time=parsed["execute_time"],
             execute_at=execute_at,
             scope_rule=parsed["scope_rule"],
-            output_format="reply" if as_reply else parsed["output_format"],
+            output_format=parsed["output_format"],
             next_action=parsed["next_action"],
             source_mail_id=mail_id,
-            reply_to=row["sender_email"] if as_reply else "",
-            reply_subject=_reply_subject(row["subject"]) if as_reply else "",
-            status="draft" if as_reply else ("pending" if execute_at else "need_time"),
+            reply_to=sender if wants_reply else "",
+            reply_subject=_reply_subject(row["subject"]) if wants_reply else "",
+            status=_status_for_time(execute_at, _run_now(parsed.get("execute_time") or "")),
         )
-        if task and as_reply:
-            save_task_draft(task["id"], _local_reply(parsed.get("todo_items") or parsed.get("scope_rule") or ""))
-            task = get_task(task["id"]) or task
 
     update_mail_parse(
         mail_id,
@@ -361,32 +387,29 @@ def parse_saved_mail(mail_id: int) -> None:
         )
         action = (parsed.get("todo_items") or "").strip()
         if moment and action:
-            as_reply = _quick_reply(action + (row.get("subject") or ""), row["sender_email"])
+            status = _status_for_time(moment)
             task = insert_customer_task(
                 customer_name=action[:40],
                 execute_time=moment,
                 execute_at=moment,
                 scope_rule=action[:200],
-                output_format="reply" if as_reply else "reminder",
-                next_action="可在页面上直接回复" if as_reply else "到点提醒，不自动发信",
+                output_format="reminder",
+                next_action="时间已过，请确认是否还要执行" if status == "need_time" else "到点提醒，不自动发信",
                 source_mail_id=mail_id,
-                reply_to=row["sender_email"] if as_reply else "",
-                reply_subject=_reply_subject(row["subject"]) if as_reply else "",
-                status="draft" if as_reply else "pending",
+                reply_to="",
+                reply_subject="",
+                status=status,
             )
-            if task and as_reply:
-                save_task_draft(task["id"], _local_reply(action))
-                task = get_task(task["id"]) or task
-                logger.info("回复草稿已可发送 id=%s 截止=%s", task["id"], moment)
-                notify_reply_ready(task)
-            elif task:
+            if task and status == "pending":
                 logger.info("当天事项已排入任务 id=%s 时间=%s", task["id"], moment)
                 notify_reminder(task)
+            elif task:
+                logger.info("当天事项时间已过，等待确认 id=%s 时间=%s", task["id"], moment)
     elif parsed["type"] != "customer_task":
         logger.info("普通邮件已解析 id=%s 待办=%s", mail_id, parsed["todo_items"] or "无")
 
 
-def ingest_mail(mail: dict) -> int:
+def ingest_mail(mail: dict, history: bool = False) -> int:
     mail_id, created = insert_mail(
         message_id=mail["message_id"],
         subject=mail["subject"],
@@ -396,6 +419,8 @@ def ingest_mail(mail: dict) -> int:
         received_at=mail["received_at"],
         mailbox_id=int(mail.get("mailbox_id") or 0),
         account=str(mail.get("account") or ""),
+        imap_uid=str(mail.get("uid") or ""),
+        history=history,
     )
     if created:
         logger.info("邮件已入库 id=%s 主题=%s", mail_id, mail["subject"])
@@ -444,30 +469,24 @@ def _pull_history(account: dict, failures: dict) -> int:
             if _scan_note.startswith("正在"):
                 _scan_note = "首次收信中断，下一轮会继续"
             return 0
-        seen_uids = []
+        stored = 0
         for mail in older:
             if should_stop():
                 return 0
             try:
-                ingest_mail(mail)
-                seen_uids.append(mail["uid"])
+                ingest_mail(mail, history=True)
+                stored += 1
             except Exception as exc:
                 uid = str(mail.get("uid") or "")
                 failures[uid] = failures.get(uid, 0) + 1
                 logger.exception("邮件入库失败 uid=%s", uid)
                 notify_error("邮件入库", exc)
-        if seen_uids:
-            try:
-                mark_seen(seen_uids, account)
-            except Exception as exc:
-                logger.exception("标记已读失败")
-                notify_error("标记已读", exc)
-        if older and not seen_uids:
+        if older and not stored:
             logger.warning("新邮箱首次收信一封都没存进去，下一轮再试")
             return 0
         mark_history_done(box_id)
-        logger.info("新邮箱 id=%s 首次收信入库 %s 封", box_id, len(seen_uids))
-        return len(seen_uids)
+        logger.info("新邮箱 id=%s 首次收信入库 %s 封，未改邮箱未读状态", box_id, stored)
+        return stored
 
 
 def scan_new_mailboxes() -> None:
@@ -529,7 +548,12 @@ def job_poll_mail() -> None:
             while pulled < ceiling and not should_stop() and rounds < 40:
                 rounds += 1
                 try:
-                    mails = fetch_unseen_mails(limit=batch, account=account, failures=failures)
+                    mails = fetch_unseen_mails(
+                        limit=batch,
+                        account=account,
+                        failures=failures,
+                        skip_uids=history_uids(int(account.get("id") or 0)),
+                    )
                 except Exception as exc:
                     logger.exception("拉取未读失败")
                     notify_error("拉取未读", exc)
@@ -545,8 +569,9 @@ def job_poll_mail() -> None:
                     if should_stop():
                         break
                     try:
-                        ingest_mail(mail)
-                        seen_uids.append(mail["uid"])
+                        mail_id = ingest_mail(mail)
+                        if not mail_from_history(mail_id):
+                            seen_uids.append(mail["uid"])
                     except Exception as exc:
                         uid = str(mail.get("uid") or "")
                         failures[uid] = failures.get(uid, 0) + 1
@@ -650,16 +675,29 @@ def _execute_task(task: dict) -> None:
 
     lookback_days = _int_env("SUMMARY_LOOKBACK_DAYS", 30, 1, 3650)
     since = (datetime.now(CST) - timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
-    mails = list(reversed(query_recent_mails(since, limit=30)))
+    source = get_mail(int(task.get("source_mail_id") or 0)) if task.get("source_mail_id") else None
+    mailbox_id = int((source or {}).get("mailbox_id") or 0)
+    mails = list(reversed(query_recent_mails(since, limit=30, mailbox_id=mailbox_id)))
+    total = count_recent_mails(since, mailbox_id)
     if not mails:
         report = (
             f"最近 {lookback_days} 天没有检索到历史邮件，本次未生成业务汇总。\n\n{DISCLAIMER}"
         )
     else:
         report = generate_summary(task, mails)
+        if total > len(mails):
+            scope = "这个邮箱" if mailbox_id else "已入库邮件"
+            report = f"{scope}在范围内有 {total} 封非垃圾邮件，本次只看了最近 {len(mails)} 封。\n\n{report}"
 
+    reply_text = " ".join(
+        [
+            task.get("next_action") or "",
+            task.get("scope_rule") or "",
+            task.get("output_format") or "",
+        ]
+    )
     reply_error = ""
-    if _should_reply(task.get("next_action", ""), task.get("reply_to", "")):
+    if _should_reply(reply_text, task.get("reply_to", "")):
         save_task_draft(task["id"], report)
         reply_note = "已写成草稿，尚未发送。请在页面上确认后再发。"
         notify_report_done(task, report, reply_note)
@@ -679,42 +717,8 @@ def _execute_task(task: dict) -> None:
 
 
 def promote_pending_replies() -> int:
-    """已经在任务里、并且来信要求回复的，改成现在就能在页面上回复。"""
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM customer_task WHERE status='pending'"
-        ).fetchall()
-    changed = 0
-    for raw in rows:
-        task = dict(raw)
-        blob = " ".join(
-            [
-                task.get("scope_rule") or "",
-                task.get("next_action") or "",
-                task.get("customer_name") or "",
-            ]
-        )
-        mail = get_mail(int(task.get("source_mail_id") or 0))
-        sender = (mail or {}).get("sender_email") or task.get("reply_to") or ""
-        summary_task = (task.get("output_format") or "") != "reminder"
-        if not _quick_reply(blob + " " + (task.get("output_format") or ""), sender, summary_task):
-            continue
-        subject = _reply_subject((mail or {}).get("subject") or task.get("customer_name") or "邮件")
-        draft = _local_reply(task.get("scope_rule") or task.get("customer_name") or "")
-        with get_conn() as conn:
-            cur = conn.execute(
-                """
-                UPDATE customer_task
-                   SET status='draft', output_format='reply', reply_to=?, reply_subject=?,
-                       report=?, next_action='可在页面上直接回复'
-                 WHERE id=? AND status='pending'
-                """,
-                (sender, subject, draft, task["id"]),
-            )
-            changed += cur.rowcount
-    if changed:
-        logger.info("已有 %s 条待回复改为可立即回复", changed)
-    return changed
+    """不再把待执行任务改成没有正文的草稿。汇总生成后才有可发送的内容。"""
+    return 0
 
 
 def _remind_unsent_replies() -> None:
@@ -767,20 +771,50 @@ def _fallback_daily(day: str, mails: list[dict], tasks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _subject_lines(mails: list[dict], limit: int = 40) -> list[str]:
+    lines = []
+    for mail in mails[:limit]:
+        subject = mail.get("subject") or "(无主题)"
+        if mail.get("usefulness") == "spam":
+            subject += "（垃圾，未进入汇总）"
+        lines.append(f"- {mail.get('received_at', '')} {subject}")
+    if len(mails) > limit:
+        lines.append(f"- 其余 {len(mails) - limit} 封未列出")
+    return lines
+
+
+def _daily_extra(today: str, spam: list[dict]) -> str:
+    """垃圾主题和今天补进来的旧信单独列出，不混进今日收信。"""
+    imported_count = count_imported_older(today)
+    imported = query_imported_older(today, limit=40) if imported_count else []
+    lines = []
+    if spam:
+        lines.append(f"已排除垃圾 {len(spam)} 封，不进入上面的总结：")
+        lines.extend(_subject_lines(spam))
+    if imported_count:
+        lines.append(f"今天新入库、日期在今天之前的邮件 {imported_count} 封，不计入今日收信：")
+        lines.extend(_subject_lines(imported))
+        if imported_count > len(imported):
+            lines.append(f"- 其余 {imported_count - len(imported)} 封未列出")
+    if not lines:
+        return ""
+    return "\n\n" + "\n".join(lines)
+
+
 def job_daily_report() -> None:
     today = datetime.now(CST).strftime("%Y-%m-%d")
     start = f"{today} 00:00:00"
     end = f"{today} 23:59:59"
     all_mails = query_mails_between(start, end)
     mails = [mail for mail in all_mails if mail.get("usefulness") != "spam"]
-    spam_count = len(all_mails) - len(mails)
+    spam = [mail for mail in all_mails if mail.get("usefulness") == "spam"]
     tasks = query_tasks_between(start, end)
-    logger.info("开始生成每日总结，邮件 %s 封，已排除垃圾 %s 封，任务 %s 条", len(mails), spam_count, len(tasks))
+    logger.info("开始生成每日总结，邮件 %s 封，已排除垃圾 %s 封，任务 %s 条", len(mails), len(spam), len(tasks))
     if not mails and not tasks:
-        if spam_count:
+        if spam:
             report = (
                 f"【邮智汇每日工作总结】\n日期：{today}\n"
-                f"今日 {spam_count} 封已标为垃圾，没有需要处理的邮件，也没有新的客户汇总任务。\n"
+                f"今日 {len(spam)} 封已标为垃圾，没有需要处理的邮件，也没有新的客户汇总任务。\n"
                 f"待办清单：无\n\n{DISCLAIMER}"
             )
         else:
@@ -792,6 +826,7 @@ def job_daily_report() -> None:
             logger.exception("每日总结生成失败，改为推送原始清单")
             notify_error("每日总结", exc)
             report = _fallback_daily(today, mails, tasks)
+    report += _daily_extra(today, spam)
     notify_daily(report)
 
 

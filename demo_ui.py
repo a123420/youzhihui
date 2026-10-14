@@ -32,6 +32,7 @@ from db_init import (
     now_str,
     replace_draft_text,
     reschedule_task,
+    retry_failed_task,
     search_mails,
     set_mail_usefulness,
 )
@@ -388,6 +389,20 @@ class DemoHandler(BaseHTTPRequestHandler):
                 delete_mails_by_usefulness(kind)
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
+                return
+            self._json(200, build_state())
+            return
+        if path == "/api/task/retry":
+            if payload.get("confirm") is not True:
+                self._json(400, {"error": "请先确认再重试"})
+                return
+            try:
+                ok = retry_failed_task(int(payload.get("id")))
+            except (TypeError, ValueError):
+                self._json(400, {"error": "没有这条任务"})
+                return
+            if not ok:
+                self._json(404, {"error": "这条任务现在不能重试"})
                 return
             self._json(200, build_state())
             return
@@ -952,6 +967,7 @@ PAGE = """<!DOCTYPE html>
         <p class="kicker">今天的收件</p>
         <h2>工作台</h2>
         <p class="rulechip" id="meta">正在读取当前规则。</p>
+        <p class="hint" id="boxScope"></p>
         <p class="hint" id="scanNote" hidden></p>
       </header>
       <section class="panel board">
@@ -1246,10 +1262,10 @@ function renderWipeBar() {
     return;
   }
   const words = {
-    all: ["删除全部", "确定删除全部已入库邮件和任务？不能恢复。", "已删除全部邮件和任务"],
-    useful: ["删除有用", "确定删除所有「有用」邮件？相关任务一并删除，不能恢复。", "已删除有用邮件"],
-    ordinary: ["删除普通", "确定删除所有「普通」邮件？相关任务一并删除，不能恢复。", "已删除普通邮件"],
-    spam: ["删除垃圾", "确定删除所有「垃圾」邮件？相关任务一并删除，不能恢复。", "已删除垃圾邮件"]
+    all: ["删除全部", "确定删除全部本机邮件和任务？邮箱里的原信还在，本机删了不能恢复。", "已删除本机全部邮件和任务"],
+    useful: ["删除有用", "确定删除本机所有「有用」记录？相关任务一并删除。邮箱里的原信还在。", "已删除本机有用记录"],
+    ordinary: ["删除普通", "确定删除本机所有「普通」记录？相关任务一并删除。邮箱里的原信还在。", "已删除本机普通记录"],
+    spam: ["删除垃圾", "确定删除本机所有「垃圾」记录？相关任务一并删除。邮箱里的原信还在。", "已删除本机垃圾记录"]
   };
   const chosen = words[kind] || words.all;
   bar.hidden = false;
@@ -1298,7 +1314,7 @@ function renderMails(rows, targetId, emptyText) {
     card.appendChild(mailTags(mail));
     const actions = node("div", "actions");
     if (pendingMailId === mail.id) {
-      actions.appendChild(node("span", "fail", "确定删除这封？不能恢复。"));
+      actions.appendChild(node("span", "fail", "确定删除这封本机记录？邮箱里的原信还在。"));
       actions.appendChild(miniButton("确定删除", "danger", async () => {
         pendingMailId = 0;
         try {
@@ -1424,6 +1440,24 @@ function renderTasks(rows, targetId, emptyText) {
         pendingTaskKind = "";
         renderTasks(rows, targetId, emptyText);
       }));
+    } else if (pendingTaskId === task.id && pendingTaskKind === "retry") {
+      actions.appendChild(node("span", "fail", "确定再试一次这条失败的任务？"));
+      actions.appendChild(miniButton("确定再试", "mini", async () => {
+        pendingTaskId = 0;
+        pendingTaskKind = "";
+        try {
+          applyState(await postJson("/api/task/retry", {id: task.id, confirm: true}));
+          showAct("已放回待执行");
+        } catch (err) {
+          showAct(err.message, true);
+          refresh();
+        }
+      }));
+      actions.appendChild(miniButton("取消", "textbtn", () => {
+        pendingTaskId = 0;
+        pendingTaskKind = "";
+        renderTasks(rows, targetId, emptyText);
+      }));
     } else if (pendingTaskId === task.id && pendingTaskKind === "send") {
       actions.appendChild(node("span", "fail", "确定发送这封回复？发出后不能撤回。"));
       actions.appendChild(miniButton("确定发送", "danger", async () => {
@@ -1479,6 +1513,13 @@ function renderTasks(rows, targetId, emptyText) {
         actions.appendChild(miniButton("发送", "mini", () => {
           pendingTaskId = task.id;
           pendingTaskKind = "send";
+          renderTasks(rows, targetId, emptyText);
+        }));
+      }
+      if (task.status === "failed") {
+        actions.appendChild(miniButton("再试一次", "mini", () => {
+          pendingTaskId = task.id;
+          pendingTaskKind = "retry";
           renderTasks(rows, targetId, emptyText);
         }));
       }
@@ -1604,6 +1645,11 @@ function applyState(data) {
   if (autoBox && document.activeElement !== autoBox) autoBox.checked = !!data.autostart;
   mailboxCount = (data.mailboxes || []).length;
   renderMailboxes(data.mailboxes || []);
+  const scope = document.getElementById("boxScope");
+  if (scope) {
+    const lines = (data.mailboxes || []).map((item) => (item.label || item.address || "邮箱") + "：" + (item.scope || ""));
+    scope.textContent = lines.join(" ");
+  }
   renderChat(data.messages || []);
   renderProposal(data.proposal || "");
   const badge = document.getElementById("badge");
@@ -1698,6 +1744,7 @@ function renderMailboxes(rows) {
     const row = node("div", "mbox");
     row.appendChild(node("b", "", item.address || ""));
     row.appendChild(node("span", "", (item.label || "自填服务器") + " · " + (item.imap_host || "")));
+    if (item.scope) row.appendChild(node("span", "", item.scope));
     if (pendingBox === item.id) {
       row.appendChild(node("span", "fail", "确定移出？已收下来的邮件还留着。"));
       row.appendChild(miniButton("确定移出", "danger", async () => {

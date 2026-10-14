@@ -142,6 +142,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE mail_info ADD COLUMN mailbox_id INTEGER DEFAULT 0")
         if "account" not in columns:
             conn.execute("ALTER TABLE mail_info ADD COLUMN account TEXT DEFAULT ''")
+        if "history_import" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN history_import INTEGER DEFAULT 0")
+        if "imap_uid" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN imap_uid TEXT DEFAULT ''")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS mailbox (
@@ -238,12 +242,20 @@ def list_mailboxes() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, address, label, imap_host, imap_port, smtp_host, smtp_port, smtp_mode
+            SELECT id, address, label, imap_host, imap_port, smtp_host, smtp_port,
+                   smtp_mode, history_done
               FROM mailbox
              ORDER BY id
             """
         ).fetchall()
-    return _rows(rows)
+    items = _rows(rows)
+    for item in items:
+        item["scope"] = (
+            "已接入最近 40 封，更早的已读信没有拉取"
+            if item.get("history_done")
+            else "正在接入最近 40 封"
+        )
+    return items
 
 
 def mailbox_accounts() -> list[dict]:
@@ -420,6 +432,8 @@ def insert_mail(
     received_at: str,
     mailbox_id: int = 0,
     account: str = "",
+    imap_uid: str = "",
+    history: bool = False,
 ) -> tuple[int, bool]:
     """写入邮件。返回 (id, 是否新插入)。同一个邮箱里的重复 Message-ID 不会再插一行。
 
@@ -444,6 +458,15 @@ def insert_mail(
                 (account, key, raw, raw),
             ).fetchone()
             if row:
+                if history:
+                    conn.execute(
+                        """
+                        UPDATE mail_info
+                           SET history_import=1, imap_uid=CASE WHEN imap_uid='' THEN ? ELSE imap_uid END
+                         WHERE id=?
+                        """,
+                        ((imap_uid or "")[:80], int(row["id"])),
+                    )
                 return int(row["id"]), False
         try:
             cur = conn.execute(
@@ -451,8 +474,8 @@ def insert_mail(
                 INSERT INTO mail_info (
                     message_id, subject, sender, sender_email, content,
                     received_at, excerpt, parse_status, parse_retry, created_at,
-                    mailbox_id, account
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                    mailbox_id, account, imap_uid, history_import
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)
                 """,
                 (
                     key,
@@ -465,6 +488,8 @@ def insert_mail(
                     now_str(),
                     int(mailbox_id or 0),
                     account or "",
+                    (imap_uid or "")[:80],
+                    1 if history else 0,
                 ),
             )
             return int(cur.lastrowid), True
@@ -473,6 +498,15 @@ def insert_mail(
                 "SELECT id FROM mail_info WHERE message_id=?",
                 (key,),
             ).fetchone()
+            if row and history:
+                conn.execute(
+                    """
+                    UPDATE mail_info
+                       SET history_import=1, imap_uid=CASE WHEN imap_uid='' THEN ? ELSE imap_uid END
+                     WHERE id=?
+                    """,
+                    ((imap_uid or "")[:80], int(row["id"])),
+                )
             return (int(row["id"]) if row else 0), False
 
 
@@ -508,6 +542,32 @@ def set_mail_usefulness(mail_id: int, usefulness: str) -> bool:
             (usefulness, notes[usefulness], mail_id),
         )
         return cur.rowcount == 1
+
+
+def history_uids(mailbox_id: int) -> set[str]:
+    """首次接入的信留在邮箱里保持原未读状态，之后扫未读时跳过它们。"""
+    if not mailbox_id:
+        return set()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT imap_uid FROM mail_info
+             WHERE mailbox_id=? AND history_import=1 AND imap_uid != ''
+            """,
+            (mailbox_id,),
+        ).fetchall()
+    return {str(row["imap_uid"]) for row in rows}
+
+
+def mail_from_history(mail_id: int) -> bool:
+    if not mail_id:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT history_import FROM mail_info WHERE id=?",
+            (mail_id,),
+        ).fetchone()
+    return bool(row and row["history_import"])
 
 
 def mark_history_done(mailbox_id: int) -> None:
@@ -579,6 +639,20 @@ def reschedule_task(task_id: int, moment: str) -> bool:
              WHERE id=? AND status NOT IN ('done', 'running')
             """,
             (text, task_id),
+        )
+        return cur.rowcount == 1
+
+
+def retry_failed_task(task_id: int) -> bool:
+    """失败的任务放回待执行。页面上确认后再试，不用改数据库。"""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE customer_task
+               SET status='pending', last_error=''
+             WHERE id=? AND status='failed'
+            """,
+            (task_id,),
         )
         return cur.rowcount == 1
 
@@ -901,19 +975,60 @@ def list_mails_need_parse(limit: int = 5) -> list[dict]:
     return _rows(rows)
 
 
-def query_recent_mails(since: str, limit: int = 30) -> list[dict]:
-    """取回溯窗口内的邮件，新邮件在前。调用方需要时间顺序时再自行反转。"""
+def query_recent_mails(since: str, limit: int = 30, mailbox_id: int = 0) -> list[dict]:
+    """取一个邮箱回溯窗口内的非垃圾邮件，新邮件在前。"""
+    sql = """
+        SELECT id, subject, sender, sender_email, content, received_at,
+               mail_type, todo_items, urgency, deadline, usefulness, mailbox_id
+          FROM mail_info
+         WHERE received_at >= ? AND usefulness != 'spam'
+    """
+    params: list = [since]
+    if mailbox_id:
+        sql += " AND mailbox_id=?"
+        params.append(mailbox_id)
+    sql += " ORDER BY received_at DESC LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return _rows(rows)
+
+
+def count_recent_mails(since: str, mailbox_id: int = 0) -> int:
+    sql = "SELECT COUNT(*) AS n FROM mail_info WHERE received_at >= ? AND usefulness != 'spam'"
+    params: list = [since]
+    if mailbox_id:
+        sql += " AND mailbox_id=?"
+        params.append(mailbox_id)
+    with get_conn() as conn:
+        row = conn.execute(sql, params).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def count_imported_older(day: str) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM mail_info
+             WHERE substr(created_at, 1, 10)=? AND substr(received_at, 1, 10) < ?
+            """,
+            (day, day),
+        ).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def query_imported_older(day: str, limit: int = 40) -> list[dict]:
+    """今天入库、原日期在今天之前的信。不计入当天收信。"""
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, subject, sender, sender_email, content, received_at,
-                   mail_type, todo_items, urgency, deadline, usefulness
+            SELECT subject, received_at, usefulness
               FROM mail_info
-             WHERE received_at >= ? AND usefulness != 'spam'
+             WHERE substr(created_at, 1, 10)=? AND substr(received_at, 1, 10) < ?
              ORDER BY received_at DESC
              LIMIT ?
             """,
-            (since, limit),
+            (day, day, limit),
         ).fetchall()
     return _rows(rows)
 

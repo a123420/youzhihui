@@ -314,6 +314,7 @@ def _fetch_selected(
     newest: bool,
     empty_note: str,
     found_note: str,
+    skip_uids: set | None = None,
 ) -> list[dict]:
     """先按条件选出邮件，断开连接后再解析正文。"""
     raw_mails = []
@@ -322,7 +323,11 @@ def _fetch_selected(
         if not all_uids:
             logger.info(empty_note)
             return []
-        pending = [uid for uid in all_uids if failures.get(uid, 0) < SKIP_AFTER]
+        skipped = {str(uid) for uid in (skip_uids or set())}
+        pending = [
+            uid for uid in all_uids
+            if uid not in skipped and failures.get(uid, 0) < SKIP_AFTER
+        ]
         uids = (pending[-limit:] if newest else pending[:limit])
         logger.info(found_note, len(all_uids), len(uids))
         for uid_text in uids:
@@ -361,6 +366,7 @@ def fetch_unseen_mails(
     limit: int | None = None,
     account: dict | None = None,
     failures: dict | None = None,
+    skip_uids: set | None = None,
 ) -> list[dict]:
     """抓取未读邮件。先断开 IMAP，再做 OCR，避免识别图片时邮箱连接超时。
 
@@ -379,6 +385,7 @@ def fetch_unseen_mails(
         False,
         "收件箱没有未读邮件",
         "收件箱未读 %s 封，本轮处理 %s 封",
+        skip_uids,
     )
 
 
@@ -387,7 +394,7 @@ def fetch_recent_mails(
     account: dict | None = None,
     failures: dict | None = None,
 ) -> list[dict]:
-    """补拉最近邮件，包含已经读过的。只在这个邮箱还没有入库记录时用。"""
+    """新邮箱第一次接入时读取最近邮件，包含已读。不改邮箱里的未读状态。"""
     if failures is None:
         failures = {}
     return _fetch_selected(
