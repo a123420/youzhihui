@@ -17,11 +17,14 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.header import decode_header
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime, parseaddr
-from html import unescape
 from pathlib import Path
 
+import html2text
 from dotenv import load_dotenv
 
 from ocr_local import extract_attachment_text, invoice_brief
@@ -85,12 +88,36 @@ def _decode_bytes(payload: bytes, charset: str | None) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
+def _prefer_body(plain: str, html: str) -> str:
+    """纯文本很短、网页里还有表格或链接时，用网页正文。正文已经写清楚时不动。"""
+    plain = (plain or "").strip()
+    html = (html or "").strip()
+    if not html:
+        return plain
+    if not plain:
+        return html
+    plain_size = len(re.sub(r"\s+", "", plain))
+    html_size = len(re.sub(r"\s+", "", html))
+    if plain_size < 40 and html_size > plain_size:
+        return html
+    return plain
+
+
 def _html_to_text(html: str) -> str:
-    html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
-    html = re.sub(r"(?i)<br\s*/?>", "\n", html)
-    html = re.sub(r"(?i)</p>", "\n", html)
-    text = re.sub(r"(?s)<[^>]+>", " ", html)
-    text = unescape(text)
+    """网页邮件收成一行行正文。表格和链接留下来，样式和图片丢掉。"""
+    parser = html2text.HTML2Text()
+    parser.body_width = 0
+    parser.ignore_images = True
+    parser.ignore_emphasis = True
+    parser.unicode_snob = True
+    parser.protect_links = True
+    parser.single_line_break = True
+    try:
+        text = parser.handle(html or "")
+    except Exception:
+        logger.warning("网页邮件转正文失败，改用去掉标签")
+        text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html or "")
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return _clean(text)
@@ -126,6 +153,42 @@ def _part_bytes(part) -> bytes:
         pass
     payload = part.get_payload(decode=True) or b""
     return bytes(payload) if isinstance(payload, (bytes, bytearray)) else b""
+
+
+_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
+    (b"GIF87a", "image/gif", ".gif"),
+    (b"GIF89a", "image/gif", ".gif"),
+    (b"BM", "image/bmp", ".bmp"),
+    (b"%PDF", "application/pdf", ".pdf"),
+)
+MAX_FILE_BYTES = 15 * 1024 * 1024
+
+
+def _real_type(filename: str, content_type: str, data: bytes) -> tuple[str, str]:
+    """邮件里贴的图常被标成 application/octet-stream、名字也没有扩展名，按文件头认出来。"""
+    if "@" in (filename or "") or filename in {"attachment.jpg", "attachment.png"}:
+        filename = "正文图片"
+    head = data[:16]
+    for magic, kind, suffix in _MAGIC:
+        if head.startswith(magic):
+            name = filename or f"附件{suffix}"
+            if not name.lower().endswith(suffix) and not (suffix == ".jpg" and name.lower().endswith(".jpeg")):
+                name = f"{name[:80]}{suffix}"
+            return name, kind
+    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return (filename if filename.lower().endswith(".webp") else f"{filename or '附件'}.webp"), "image/webp"
+    return filename or "附件", content_type or "application/octet-stream"
+
+
+def keep_file(content_type: str, data: bytes) -> bool:
+    """签名小图标不存。其余图片和文件都存下来，页面上能看到。"""
+    if not data or len(data) > MAX_FILE_BYTES:
+        return False
+    if content_type.startswith("image/") and len(data) < 4096:
+        return False
+    return True
 
 
 def _append_ocr(content: str, filename: str, text: str) -> str:
@@ -251,7 +314,8 @@ def _build_mail(uid: str, raw: bytes, internal_date: str = "") -> dict:
         if looks_like_file:
             data = _part_bytes(part)
             if data:
-                attachments.append((filename or _default_name(content_type), content_type, data))
+                name, real = _real_type(filename or _default_name(content_type), content_type, data)
+                attachments.append((name, real, data))
             if not is_text:
                 continue
         if content_type == "text/plain":
@@ -259,16 +323,11 @@ def _build_mail(uid: str, raw: bytes, internal_date: str = "") -> dict:
         elif content_type == "text/html":
             html_parts.append(_part_text(part))
 
-    content = _clean("\n".join(part for part in plain_parts if part.strip()))
-    if not content:
-        content = _clean("\n".join(_html_to_text(part) for part in html_parts if part.strip()))
+    plain = _clean("\n".join(part for part in plain_parts if part.strip()))
+    html = _clean("\n".join(_html_to_text(part) for part in html_parts if part.strip()))
+    content = _prefer_body(plain, html)
 
-    for filename, content_type, data in attachments:
-        text = extract_attachment_text(filename, content_type, data)
-        if not text:
-            continue
-        logger.info("附件 OCR 完成: %s，识别 %s 字", filename, len(text))
-        content = _append_ocr(content, filename, text)
+    content = content + attachment_ocr(attachments)
 
     if len(content) > MAX_CONTENT_CHARS:
         content = content[:MAX_CONTENT_CHARS] + "\n...(正文过长已截断)"
@@ -281,7 +340,53 @@ def _build_mail(uid: str, raw: bytes, internal_date: str = "") -> dict:
         "sender_email": address[:200],
         "content": content,
         "received_at": _received_at(message, internal_date),
+        "files": [
+            {"name": name, "type": kind, "data": data}
+            for name, kind, data in attachments
+            if keep_file(kind, data)
+        ],
     }
+
+
+def attachment_ocr(attachments: list[tuple[str, str, bytes]]) -> str:
+    """图片和 PDF 附件识别出的文字，拼成可以接在正文后面的一段。"""
+    block = ""
+    for filename, content_type, data in attachments:
+        text = extract_attachment_text(filename, content_type, data)
+        if not text:
+            continue
+        logger.info("附件 OCR 完成: %s，识别 %s 字", filename, len(text))
+        block = _append_ocr(block, filename, text)
+    return block
+
+
+def mail_attachments(uid: str, account: dict | None) -> list[tuple[str, str, bytes]]:
+    """回到邮箱里只读取一封信的附件。用 BODY.PEEK，不改未读状态。"""
+    with _imap_session(account) as client:
+        status, fetched = client.uid("FETCH", uid, "(BODY.PEEK[])")
+    if status != "OK":
+        return []
+    raw = _rfc822(fetched)
+    if not raw:
+        return []
+    message = email.message_from_bytes(raw, policy=policy.default)
+    found = []
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        content_type = part.get_content_type()
+        filename = part.get_filename()
+        if filename and "=?" in filename:
+            filename = _decode_mime(filename)
+        filename = _clean(filename or "")
+        if content_type in {"text/plain", "text/html"} and part.get_content_disposition() != "attachment":
+            continue
+        data = _part_bytes(part)
+        if not data:
+            continue
+        name, real = _real_type(filename or _default_name(content_type), content_type, data)
+        found.append((name, real, data))
+    return found
 
 
 def _default_name(content_type: str) -> str:
@@ -420,8 +525,47 @@ def mark_seen(uids: list[str], account: dict | None = None) -> None:
     logger.info("已标记已读 %s 封", len(uids))
 
 
-def send_mail(to_addr: str, subject: str, body: str, account: dict | None = None) -> None:
-    """用指定邮箱的 SMTP 发送纯文本邮件。没指定时用当前保存的第一个邮箱。"""
+def _outgoing_message(
+    username: str,
+    to_addr: str,
+    subject: str,
+    body: str,
+    attachments: list[tuple[str, str, bytes]] | None = None,
+):
+    """没有附件时仍是纯文本。有附件时正文和文件放在同一封信里。"""
+    files = attachments or []
+    if files:
+        message = MIMEMultipart()
+        message.attach(MIMEText(body or "", "plain", "utf-8"))
+        for name, kind, data in files:
+            main, sub = "application", "octet-stream"
+            if "/" in (kind or ""):
+                left, right = kind.split("/", 1)
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,40}", left) and re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9.+-]{0,40}", right
+                ):
+                    main, sub = left, right
+            part = MIMEBase(main, sub)
+            part.set_payload(data)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=("utf-8", "", name))
+            message.attach(part)
+    else:
+        message = MIMEText(body or "", "plain", "utf-8")
+    message["Subject"] = subject or "邮件汇总"
+    message["From"] = username
+    message["To"] = to_addr
+    return message
+
+
+def send_mail(
+    to_addr: str,
+    subject: str,
+    body: str,
+    account: dict | None = None,
+    attachments: list[tuple[str, str, bytes]] | None = None,
+) -> None:
+    """用指定邮箱的 SMTP 发送。没指定时用当前保存的第一个邮箱。附件随信发出。"""
     if account:
         username = str(account.get("address") or "").strip()
         password = str(account.get("password") or "").strip()
@@ -443,10 +587,7 @@ def send_mail(to_addr: str, subject: str, body: str, account: dict | None = None
         raise RuntimeError("还没有识别出发信服务器")
     if not to_addr:
         raise RuntimeError("收件人邮箱为空")
-    message = MIMEText(body or "", "plain", "utf-8")
-    message["Subject"] = subject or "邮件汇总"
-    message["From"] = username
-    message["To"] = to_addr
+    message = _outgoing_message(username, to_addr, subject, body, attachments)
     if mode == "starttls" or port == 587:
         with smtplib.SMTP(host, port, timeout=30) as smtp:
             smtp.ehlo()
@@ -458,4 +599,4 @@ def send_mail(to_addr: str, subject: str, body: str, account: dict | None = None
         with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
             smtp.login(username, password)
             smtp.sendmail(username, [to_addr], message.as_string())
-    logger.info("SMTP 已发送至 %s", to_addr)
+    logger.info("SMTP 已发送，附件 %s 个", len(attachments or []))

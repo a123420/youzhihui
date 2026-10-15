@@ -97,7 +97,8 @@ def init_db() -> None:
                 report TEXT DEFAULT '',
                 last_error TEXT DEFAULT '',
                 created_at TEXT DEFAULT '',
-                executed_at TEXT DEFAULT ''
+                executed_at TEXT DEFAULT '',
+                hide_with INTEGER DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_mail_received ON mail_info(received_at);
@@ -146,6 +147,50 @@ def init_db() -> None:
             conn.execute("ALTER TABLE mail_info ADD COLUMN history_import INTEGER DEFAULT 0")
         if "imap_uid" not in columns:
             conn.execute("ALTER TABLE mail_info ADD COLUMN imap_uid TEXT DEFAULT ''")
+        if "source" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN source TEXT DEFAULT 'mail'")
+        if "file_name" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN file_name TEXT DEFAULT ''")
+        if "files_checked" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN files_checked INTEGER DEFAULT 0")
+        if "task_made" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN task_made INTEGER DEFAULT 0")
+            conn.execute(
+                "UPDATE mail_info SET task_made=1 WHERE id IN (SELECT source_mail_id FROM customer_task)"
+            )
+        if "seen_marked" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN seen_marked INTEGER DEFAULT 0")
+            conn.execute("UPDATE mail_info SET seen_marked=1")
+        if "hidden" not in columns:
+            conn.execute("ALTER TABLE mail_info ADD COLUMN hidden INTEGER DEFAULT 0")
+        task_columns = {row[1] for row in conn.execute("PRAGMA table_info(customer_task)")}
+        if "hidden" not in task_columns:
+            conn.execute("ALTER TABLE customer_task ADD COLUMN hidden INTEGER DEFAULT 0")
+        if "hide_with" not in task_columns:
+            conn.execute("ALTER TABLE customer_task ADD COLUMN hide_with INTEGER DEFAULT 0")
+            conn.execute("UPDATE customer_task SET hide_with=1 WHERE IFNULL(hidden,0)=1")
+            conn.execute(
+                """
+                UPDATE customer_task
+                   SET hide_with=2
+                 WHERE IFNULL(hidden,0)=1
+                   AND source_mail_id IN (SELECT id FROM mail_info WHERE IFNULL(hidden,0)=1)
+                """
+            )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mail_file (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mail_id INTEGER NOT NULL,
+                name TEXT DEFAULT '',
+                content_type TEXT DEFAULT '',
+                size INTEGER DEFAULT 0,
+                stored TEXT DEFAULT '',
+                created_at TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_file_mail ON mail_file(mail_id)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS mailbox (
@@ -232,7 +277,10 @@ def _import_env_mailbox(conn) -> None:
     primary = conn.execute("SELECT id, address FROM mailbox ORDER BY id LIMIT 1").fetchone()
     if primary:
         conn.execute(
-            "UPDATE mail_info SET mailbox_id=?, account=? WHERE IFNULL(mailbox_id, 0)=0",
+            """
+            UPDATE mail_info SET mailbox_id=?, account=?
+             WHERE IFNULL(mailbox_id, 0)=0 AND IFNULL(source, 'mail') != 'upload'
+            """,
             (primary["id"], primary["address"]),
         )
 
@@ -401,7 +449,7 @@ def mask_sensitive(text: str) -> str:
 
 
 def _mask_card(row: dict) -> dict:
-    for key in ("subject", "excerpt", "todo_items", "judge_note", "parse_error", "report", "last_error"):
+    for key in ("subject", "excerpt", "todo_items", "judge_note", "parse_error", "report", "last_error", "recognition", "reply_report"):
         if key == "report" and row.get("status") == "draft":
             continue
         if row.get(key):
@@ -411,10 +459,15 @@ def _mask_card(row: dict) -> dict:
 
 _MAIL_CARD_SQL = """
 SELECT id, subject, sender, sender_email, received_at, created_at, mail_type,
-       urgency, deadline, usefulness, parse_status, account,
-       substr(todo_items, 1, 80) AS todo_items,
+       urgency, deadline, usefulness, parse_status, account, source,
+       substr(todo_items, 1, 180) AS todo_items,
        substr(judge_note, 1, 80) AS judge_note,
        CASE WHEN parse_status = 'failed' THEN substr(raw_json, 1, 80) ELSE '' END AS parse_error,
+       (SELECT COUNT(*) FROM mail_file f WHERE f.mail_id = mail_info.id) AS file_count,
+       (SELECT t.id FROM customer_task t WHERE t.source_mail_id = mail_info.id ORDER BY t.id LIMIT 1) AS task_id,
+       (SELECT t.execute_at FROM customer_task t WHERE t.source_mail_id = mail_info.id ORDER BY t.id LIMIT 1) AS task_at,
+       (SELECT t.status FROM customer_task t WHERE t.source_mail_id = mail_info.id ORDER BY t.id LIMIT 1) AS task_status,
+       (SELECT substr(t.report, 1, 400) FROM customer_task t WHERE t.source_mail_id = mail_info.id AND t.status != 'draft' ORDER BY t.id LIMIT 1) AS reply_report,
        CASE
          WHEN excerpt != '' THEN excerpt
          ELSE substr(replace(replace(content, char(10), ' '), char(13), ' '), 1, 120)
@@ -434,6 +487,8 @@ def insert_mail(
     account: str = "",
     imap_uid: str = "",
     history: bool = False,
+    source: str = "mail",
+    file_name: str = "",
 ) -> tuple[int, bool]:
     """写入邮件。返回 (id, 是否新插入)。同一个邮箱里的重复 Message-ID 不会再插一行。
 
@@ -474,8 +529,8 @@ def insert_mail(
                 INSERT INTO mail_info (
                     message_id, subject, sender, sender_email, content,
                     received_at, excerpt, parse_status, parse_retry, created_at,
-                    mailbox_id, account, imap_uid, history_import
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)
+                    mailbox_id, account, imap_uid, history_import, source, file_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     key,
@@ -490,6 +545,8 @@ def insert_mail(
                     account or "",
                     (imap_uid or "")[:80],
                     1 if history else 0,
+                    source or "mail",
+                    (file_name or "")[:200],
                 ),
             )
             return int(cur.lastrowid), True
@@ -544,6 +601,45 @@ def set_mail_usefulness(mail_id: int, usefulness: str) -> bool:
         return cur.rowcount == 1
 
 
+def stored_uids(mailbox_id: int) -> set[str]:
+    """已经入库的信不再重复收取。识别完成前也不从邮箱里再下一遍。"""
+    if not mailbox_id:
+        return set()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT imap_uid FROM mail_info WHERE mailbox_id=? AND imap_uid != ''",
+            (mailbox_id,),
+        ).fetchall()
+    return {str(row["imap_uid"]) for row in rows}
+
+
+def mails_ready_for_seen(limit: int = 80) -> list[dict]:
+    """识别已经完成、又不是首次回填的信，才可以在邮箱里标已读。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, mailbox_id, imap_uid FROM mail_info
+             WHERE parse_status='ok' AND history_import=0 AND seen_marked=0
+               AND IFNULL(hidden,0)=0
+               AND imap_uid != '' AND source='mail' AND mailbox_id > 0
+             ORDER BY id ASC
+             LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_seen_done(mail_ids: list[int]) -> None:
+    if not mail_ids:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            "UPDATE mail_info SET seen_marked=1 WHERE id=?",
+            [(int(mail_id),) for mail_id in mail_ids],
+        )
+
+
 def history_uids(mailbox_id: int) -> set[str]:
     """首次接入的信留在邮箱里保持原未读状态，之后扫未读时跳过它们。"""
     if not mailbox_id:
@@ -576,12 +672,201 @@ def mark_history_done(mailbox_id: int) -> None:
         conn.execute("UPDATE mailbox SET history_done=1 WHERE id=?", (mailbox_id,))
 
 
-def delete_mail(mail_id: int) -> bool:
-    """删掉一封邮件，以及由它生成的任务。"""
+UPLOAD_DIR = BASE_DIR / "data" / "uploads"
+
+
+def upload_path(file_name: str) -> Path | None:
+    """上传件只放在 data/uploads 里，名字由内容摘要生成。"""
+    name = Path(file_name or "").name
+    if not name or name != file_name:
+        return None
+    return UPLOAD_DIR / name
+
+
+def _remove_uploads(names: list[str]) -> None:
+    for name in names:
+        path = upload_path(name)
+        if path is None:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _upload_names(conn, where: str, params: tuple | list) -> list[str]:
+    rows = conn.execute(
+        f"SELECT file_name FROM mail_info WHERE source='upload' AND file_name != '' AND {where}",
+        params,
+    ).fetchall()
+    return [str(row["file_name"]) for row in rows]
+
+
+FILE_DIR = BASE_DIR / "data" / "attachments"
+
+
+def _file_path(stored: str) -> Path | None:
+    name = Path(stored or "").name
+    if not name or name != stored:
+        return None
+    return FILE_DIR / name
+
+
+def save_mail_files(mail_id: int, files: list[dict]) -> int:
+    """把邮件里的图片和文件存到 data/attachments。同一封信已经存过的不再重复存。"""
+    import hashlib
+
+    saved = 0
     with get_conn() as conn:
-        conn.execute("DELETE FROM customer_task WHERE source_mail_id=?", (mail_id,))
-        cur = conn.execute("DELETE FROM mail_info WHERE id=?", (mail_id,))
-        return cur.rowcount == 1
+        known = {
+            str(row["stored"])
+            for row in conn.execute("SELECT stored FROM mail_file WHERE mail_id=?", (mail_id,))
+        }
+        for item in files or []:
+            data = item.get("data") or b""
+            if not data:
+                continue
+            name = Path(str(item.get("name") or "附件")).name[:120] or "附件"
+            suffix = Path(name).suffix.lower()[:8]
+            stored = f"{mail_id}_{hashlib.sha256(data).hexdigest()[:20]}{suffix}"
+            if stored in known:
+                continue
+            FILE_DIR.mkdir(parents=True, exist_ok=True)
+            path = FILE_DIR / stored
+            path.write_bytes(data)
+            conn.execute(
+                """
+                INSERT INTO mail_file (mail_id, name, content_type, size, stored, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (mail_id, name, str(item.get("type") or ""), len(data), stored, now_str()),
+            )
+            known.add(stored)
+            saved += 1
+        conn.execute("UPDATE mail_info SET files_checked=1 WHERE id=?", (mail_id,))
+    return saved
+
+
+def list_mail_files(mail_id: int) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, content_type, size FROM mail_file WHERE mail_id=? ORDER BY id",
+            (mail_id,),
+        ).fetchall()
+    return _rows(rows)
+
+
+def mail_file_for(file_id: int) -> tuple[Path, str, str] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT name, content_type, stored FROM mail_file WHERE id=?",
+            (file_id,),
+        ).fetchone()
+    if not row:
+        return None
+    path = _file_path(str(row["stored"] or ""))
+    if path is None or not path.is_file():
+        return None
+    return path, str(row["name"] or path.name), str(row["content_type"] or "")
+
+
+def _stored_files(conn, where: str, params: tuple | list) -> list[str]:
+    rows = conn.execute(
+        f"SELECT stored FROM mail_file WHERE mail_id IN (SELECT id FROM mail_info WHERE {where})",
+        params,
+    ).fetchall()
+    return [str(row["stored"]) for row in rows]
+
+
+def _remove_stored(names: list[str]) -> None:
+    for name in names:
+        path = _file_path(name)
+        if path is None:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def mails_needing_files(since: str, limit: int = 80) -> list[dict]:
+    """最近几天还没检查过附件的信。只看能回到邮箱里找的信。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, mailbox_id, imap_uid
+              FROM mail_info
+             WHERE IFNULL(files_checked, 0) = 0
+               AND source = 'mail'
+               AND imap_uid != '' AND mailbox_id > 0
+               AND received_at >= ?
+             ORDER BY id DESC
+             LIMIT ?
+            """,
+            (since, limit),
+        ).fetchall()
+    return _rows(rows)
+
+
+def append_mail_ocr(mail_id: int, block: str) -> None:
+    if not block:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE mail_info SET content = IFNULL(content, '') || ? WHERE id=?",
+            (block, mail_id),
+        )
+
+
+def upload_file_for(mail_id: int) -> tuple[Path, str] | None:
+    """上传件的原文件和显示名。不是上传件时返回空。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT subject, file_name FROM mail_info WHERE id=? AND source='upload'",
+            (mail_id,),
+        ).fetchone()
+    if not row:
+        return None
+    path = upload_path(str(row["file_name"] or ""))
+    if path is None or not path.is_file():
+        return None
+    return path, str(row["subject"] or path.name)
+
+
+def delete_mail(mail_id: int) -> bool:
+    """单封先藏起来。只连同藏起当时还在列表里的任务，单独藏过的任务不动。"""
+    with get_conn() as conn:
+        cur = conn.execute("UPDATE mail_info SET hidden=1 WHERE id=? AND IFNULL(hidden,0)=0", (mail_id,))
+        ok = cur.rowcount == 1
+        if ok:
+            conn.execute(
+                """
+                UPDATE customer_task
+                   SET hidden=1, hide_with=2
+                 WHERE source_mail_id=? AND IFNULL(hidden,0)=0
+                """,
+                (mail_id,),
+            )
+    return ok
+
+
+def undo_mail(mail_id: int) -> bool:
+    """只恢复跟着这封邮件一起藏起来的任务。"""
+    with get_conn() as conn:
+        cur = conn.execute("UPDATE mail_info SET hidden=0 WHERE id=? AND hidden=1", (mail_id,))
+        ok = cur.rowcount == 1
+        if ok:
+            conn.execute(
+                """
+                UPDATE customer_task
+                   SET hidden=0, hide_with=0
+                 WHERE source_mail_id=? AND hide_with=2
+                """,
+                (mail_id,),
+            )
+    return ok
 
 
 def delete_all_stored() -> tuple[int, int]:
@@ -593,12 +878,19 @@ def delete_mails_by_usefulness(kind: str) -> tuple[int, int]:
     """按分类删除已入库邮件。全部时连任务一起清掉。"""
     if kind == "all":
         with get_conn() as conn:
+            names = _upload_names(conn, "1=1", ())
+            stored = _stored_files(conn, "1=1", ())
             tasks = conn.execute("DELETE FROM customer_task").rowcount
+            conn.execute("DELETE FROM mail_file")
             mails = conn.execute("DELETE FROM mail_info").rowcount
+        _remove_uploads(names)
+        _remove_stored(stored)
         return mails, tasks
     if kind not in {"useful", "ordinary", "spam"}:
         raise ValueError("分类无效")
     with get_conn() as conn:
+        names = _upload_names(conn, "usefulness=?", (kind,))
+        stored = _stored_files(conn, "usefulness=?", (kind,))
         ids = [row["id"] for row in conn.execute("SELECT id FROM mail_info WHERE usefulness=?", (kind,))]
         tasks = 0
         mails = 0
@@ -609,11 +901,20 @@ def delete_mails_by_usefulness(kind: str) -> tuple[int, int]:
                 f"DELETE FROM customer_task WHERE source_mail_id IN ({marks})",
                 chunk,
             ).rowcount
+            conn.execute(f"DELETE FROM mail_file WHERE mail_id IN ({marks})", chunk)
             mails += conn.execute(
                 f"DELETE FROM mail_info WHERE id IN ({marks})",
                 chunk,
             ).rowcount
+    _remove_uploads(names)
+    _remove_stored(stored)
     return mails, tasks
+
+
+def delete_done_tasks() -> int:
+    """一次删掉所有已完成的任务。邮件本身留着。"""
+    with get_conn() as conn:
+        return conn.execute("DELETE FROM customer_task WHERE status='done'").rowcount
 
 
 def reschedule_task(task_id: int, moment: str) -> bool:
@@ -672,8 +973,39 @@ def complete_task(task_id: int) -> bool:
 
 
 def delete_task(task_id: int) -> bool:
+    """单条先藏起来，刷新前可以撤回。"""
     with get_conn() as conn:
-        cur = conn.execute("DELETE FROM customer_task WHERE id=?", (task_id,))
+        cur = conn.execute(
+            "UPDATE customer_task SET hidden=1, hide_with=1 WHERE id=? AND IFNULL(hidden,0)=0",
+            (task_id,),
+        )
+        return cur.rowcount == 1
+
+
+def undo_task(task_id: int) -> bool:
+    """只恢复单独藏起的任务。跟着邮件一起藏的，要撤回邮件才回来。"""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE customer_task SET hidden=0, hide_with=0 WHERE id=? AND hidden=1 AND hide_with=1",
+            (task_id,),
+        )
+        return cur.rowcount == 1
+
+
+def reopen_task(task_id: int) -> bool:
+    """已完成回到未完成。回复原文留着，不再问一次。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT execute_at FROM customer_task WHERE id=? AND status='done' AND IFNULL(hidden,0)=0",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return False
+        status = "pending" if str(row["execute_at"] or "").strip() else "need_time"
+        cur = conn.execute(
+            "UPDATE customer_task SET status=?, executed_at='' WHERE id=? AND status='done'",
+            (status, task_id),
+        )
         return cur.rowcount == 1
 
 
@@ -688,6 +1020,63 @@ def save_task_draft(task_id: int, report: str) -> None:
             """,
             ((report or "")[:MAX_REPLY_CHARS], task_id),
         )
+
+
+_REPLY_STATUSES = ("draft", "pending", "need_time", "failed", "done")
+
+
+def bind_task_reply(task_id: int) -> dict | None:
+    """发送前补上原信发件人。没有地址时仍返回任务，由页面说明不能发。"""
+    task = get_task(task_id)
+    if not task or task.get("status") not in _REPLY_STATUSES:
+        return None
+    address = str(task.get("reply_to") or "").strip()
+    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address):
+        return task
+    source = int(task.get("source_mail_id") or 0)
+    sender = ""
+    subject = ""
+    if source:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT sender_email, subject FROM mail_info WHERE id=?",
+                (source,),
+            ).fetchone()
+        if row:
+            sender = str(row["sender_email"] or "").strip()
+            subject = str(row["subject"] or "").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", sender):
+        return task
+    reply_subject = subject[:200] if subject.lower().startswith("re:") else f"Re: {subject}"[:200]
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE customer_task
+               SET reply_to=?, reply_subject=?
+             WHERE id=? AND status IN ('draft', 'pending', 'need_time', 'failed')
+            """,
+            (sender, reply_subject, task_id),
+        )
+    return get_task(task_id)
+
+
+def save_reply_body(task_id: int, body: str) -> bool:
+    """确认发送时才把回复存成草稿。空内容不会改任务状态。"""
+    text = (body or "").strip()
+    if not text:
+        return False
+    if len(text) > MAX_REPLY_CHARS:
+        raise ValueError(f"回复太长，最多 {MAX_REPLY_CHARS} 字")
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE customer_task
+               SET report=?, status='draft', last_error=''
+             WHERE id=? AND status IN ('draft', 'pending', 'need_time', 'failed', 'done')
+            """,
+            (text, task_id),
+        )
+        return cur.rowcount == 1
 
 
 def replace_draft_text(task_id: int, body: str) -> bool:
@@ -712,6 +1101,7 @@ def list_unsent_due(moment: str) -> list[dict]:
             SELECT id, customer_name, execute_at, scope_rule, reply_to
               FROM customer_task
              WHERE status='draft' AND execute_at != '' AND execute_at <= ?
+               AND IFNULL(hidden,0)=0
                AND (last_error IS NULL OR last_error NOT LIKE '到点未发送%')
              ORDER BY execute_at ASC
              LIMIT 10
@@ -762,9 +1152,10 @@ def search_mails(query: str, limit: int = 100) -> list[dict]:
         rows = conn.execute(
             _MAIL_CARD_SQL
             + """
-             WHERE subject LIKE ? OR sender LIKE ? OR sender_email LIKE ?
+             WHERE IFNULL(hidden,0)=0 AND (
+                   subject LIKE ? OR sender LIKE ? OR sender_email LIKE ?
                 OR excerpt LIKE ? OR todo_items LIKE ? OR judge_note LIKE ?
-                OR content LIKE ? OR account LIKE ?
+                OR content LIKE ? OR account LIKE ?)
              ORDER BY id DESC
              LIMIT ?
             """,
@@ -791,6 +1182,9 @@ def mail_detail(mail_id: int) -> dict | None:
         "todo_items": row.get("todo_items") or "",
         "content": content[:16000],
         "truncated": truncated,
+        "source": row.get("source") or "mail",
+        "has_file": bool(row.get("source") == "upload" and row.get("file_name")),
+        "files": list_mail_files(int(row["id"])),
     }
 
 
@@ -807,6 +1201,12 @@ _EXPORT_STATUS = {
 }
 
 
+_DISCLAIMER = "【提示】以上内容由AI辅助生成，请人工复核后再发送或执行。"
+_SEND_NOTE = re.compile(r"发信情况[:：].*")
+_REPLY_LEAD = re.compile(r"^关于「[^」]*」[，,]?\s*回复如下[:：]\s*")
+_REMIND_LEAD = re.compile(r"^到点提醒[:：]\s*")
+
+
 def _sheet_text(value: str, limit: int = 180) -> str:
     text = mask_sensitive(value or "")
     text = text.replace("\r", " ").replace("\n", " ")
@@ -814,6 +1214,50 @@ def _sheet_text(value: str, limit: int = 180) -> str:
     if len(text) > limit:
         text = text[:limit] + "…"
     return text or "—"
+
+
+def _fuller(primary: str, extra: str) -> str:
+    """两句说的是同一件事时，留更完整的那句。"""
+    first = re.sub(r"\s+", " ", (primary or "").strip())
+    second = re.sub(r"\s+", " ", (extra or "").strip())
+    if not second:
+        return first
+    if not first or (first in second and len(second) > len(first)):
+        return second
+    return first
+
+
+def _sheet_recognition(action: str, deadline: str) -> str:
+    """识别写成能直接看懂的一句。正文里没有钟点时，补上截止时间。"""
+    text = re.sub(r"\s+", " ", (action or "").replace("\r", " ").replace("\n", " ")).strip()
+    when = (deadline or "").strip()
+    stamp = when[:16] if re.match(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", when) else ""
+    if stamp and stamp not in text and not re.search(r"\d{1,2}\s*[:：点时]", text):
+        text = f"{text}（{stamp}）" if text else stamp
+    return _sheet_text(text, 240)
+
+
+def _sheet_reply(report: str, *titles: str) -> str:
+    """表格里留本人写过或发出的回复。提示语、发信记录和识别原文不放进来。"""
+    text = report or ""
+    text = text.replace(_DISCLAIMER, " ")
+    text = _SEND_NOTE.sub(" ", text)
+    text = _REPLY_LEAD.sub("", text)
+    text = _REMIND_LEAD.sub("", text)
+    text = re.sub(r"\s+", " ", text.replace("\r", " ").replace("\n", " ")).strip()
+    if not text:
+        return "—"
+    for title in titles:
+        name = re.sub(r"\s+", " ", (title or "").strip())
+        if not name:
+            continue
+        if text == name or (len(text) >= 8 and text in name):
+            return "—"
+        if text.startswith(name):
+            text = text[len(name):].strip(" ，,。:：")
+            if not text:
+                return "—"
+    return _sheet_text(text)
 
 
 def _sheet_who(sender: str, email: str) -> str:
@@ -839,26 +1283,38 @@ def export_period_sheet(start: str, end: str) -> bytes:
     with get_conn() as conn:
         mails = conn.execute(
             """
-            SELECT received_at, sender, sender_email, subject, usefulness,
+            SELECT received_at, sender, sender_email, subject, usefulness, deadline,
                    CASE
+                     WHEN todo_items != '' THEN substr(todo_items, 1, 240)
                      WHEN excerpt != '' THEN excerpt
                      ELSE substr(replace(replace(content, char(10), ' '), char(13), ' '), 1, 160)
-                   END AS excerpt,
-                   substr(todo_items, 1, 80) AS todo_items
+                   END AS recognition,
+                   (SELECT substr(t.report, 1, 400)
+                      FROM customer_task t
+                     WHERE t.source_mail_id = mail_info.id AND t.status != 'draft'
+                     ORDER BY t.id LIMIT 1) AS report
               FROM mail_info
-             WHERE received_at >= ? AND received_at <= ?
+             WHERE received_at >= ? AND received_at <= ? AND IFNULL(hidden,0)=0
              ORDER BY received_at ASC
             """,
             (start_at, end_at),
         ).fetchall()
         tasks = conn.execute(
             """
-            SELECT execute_at, created_at, customer_name, scope_rule, status,
-                   substr(report, 1, 200) AS report
-              FROM customer_task
-             WHERE (execute_at >= ? AND execute_at <= ?)
-                OR (created_at >= ? AND created_at <= ?)
-             ORDER BY execute_at ASC, id ASC
+            SELECT t.execute_at, t.created_at,
+                   CASE
+                     WHEN trim(IFNULL(t.customer_name, '')) != '' THEN t.customer_name
+                     ELSE IFNULL(m.sender, '')
+                   END AS customer_name,
+                   t.scope_rule, t.status, substr(t.report, 1, 400) AS report,
+                   IFNULL(m.todo_items, '') AS todo_items,
+                   IFNULL(m.deadline, '') AS deadline
+              FROM customer_task t
+              LEFT JOIN mail_info m ON m.id = t.source_mail_id
+             WHERE IFNULL(t.hidden,0)=0 AND (
+                   (t.execute_at >= ? AND t.execute_at <= ?)
+                OR (t.execute_at = '' AND t.created_at >= ? AND t.created_at <= ?))
+             ORDER BY t.execute_at ASC, t.id ASC
             """,
             (start_at, end_at, start_at, end_at),
         ).fetchall()
@@ -869,26 +1325,29 @@ def export_period_sheet(start: str, end: str) -> bytes:
             (row["received_at"] or "")[:16],
             _sheet_who(row["sender"] or "", row["sender_email"] or ""),
             _sheet_text(row["subject"] or "", 80) if (row["subject"] or "").strip() else "（无主题）",
-            _sheet_text(row["excerpt"] or row["todo_items"] or ""),
+            _sheet_recognition(row["recognition"] or "", row["deadline"] or ""),
+            _sheet_reply(row["report"] or "", row["recognition"] or "", row["subject"] or ""),
             _EXPORT_STATUS.get(row["usefulness"] or "", row["usefulness"] or "—"),
         ])
     for row in tasks:
+        seen = _fuller(row["scope_rule"] or "", row["todo_items"] or "")
         rows.append([
             "任务",
             ((row["execute_at"] or row["created_at"] or ""))[:16],
             _sheet_text(row["customer_name"] or "", 40),
             _sheet_text(row["scope_rule"] or "", 80),
-            _sheet_text(row["report"] or ""),
+            _sheet_recognition(seen, row["deadline"] or ""),
+            _sheet_reply(row["report"] or "", row["scope_rule"] or "", row["todo_items"] or ""),
             _EXPORT_STATUS.get(row["status"] or "", row["status"] or "—"),
         ])
-    widths = (72, 150, 220, 240, 360, 88)
-    headers = ("种类", "时间", "对方", "标题", "内容", "状态")
+    widths = (64, 132, 160, 180, 280, 160, 80)
+    headers = ("种类", "时间", "对方", "标题", "识别", "回复", "状态")
     body = [
         "<tr>" + "".join(f"<td>{html.escape(cell)}</td>" for cell in item) + "</tr>"
         for item in rows
     ]
     if not body:
-        body = ["<tr><td colspan=\"6\">这段日期里没有邮件或任务。</td></tr>"]
+        body = ["<tr><td colspan=\"7\">这段日期里没有邮件或任务。</td></tr>"]
     cols = "".join(f"<col width=\"{width}\">" for width in widths)
     head = "".join(f"<th>{html.escape(name)}</th>" for name in headers)
     title = html.escape(f"邮智汇导出  {start} 至 {end}")
@@ -897,7 +1356,7 @@ def export_period_sheet(start: str, end: str) -> bytes:
 <meta charset="utf-8">
 <title>{title}</title>
 <style>
-table {{ border-collapse: collapse; table-layout: fixed; width: 1130px; font-family: "Microsoft YaHei", sans-serif; font-size: 12px; }}
+table {{ border-collapse: collapse; table-layout: fixed; width: 1056px; font-family: "Microsoft YaHei", sans-serif; font-size: 12px; }}
 caption {{ caption-side: top; text-align: left; font-size: 16px; font-weight: 700; padding: 8px 4px 12px; }}
 th, td {{ border: 1px solid #d9d3c7; padding: 8px 10px; vertical-align: top; text-align: left; mso-number-format:"\\@"; white-space: normal; word-wrap: break-word; }}
 th {{ background: #0e6b62; color: #fff; font-weight: 700; }}
@@ -966,7 +1425,7 @@ def list_mails_need_parse(limit: int = 5) -> list[dict]:
         rows = conn.execute(
             """
             SELECT * FROM mail_info
-             WHERE parse_status != 'ok' AND parse_retry < ?
+             WHERE parse_status != 'ok' AND parse_retry < ? AND IFNULL(hidden,0)=0
              ORDER BY id DESC
              LIMIT ?
             """,
@@ -981,7 +1440,7 @@ def query_recent_mails(since: str, limit: int = 30, mailbox_id: int = 0) -> list
         SELECT id, subject, sender, sender_email, content, received_at,
                mail_type, todo_items, urgency, deadline, usefulness, mailbox_id
           FROM mail_info
-         WHERE received_at >= ? AND usefulness != 'spam'
+         WHERE received_at >= ? AND usefulness != 'spam' AND IFNULL(hidden,0)=0
     """
     params: list = [since]
     if mailbox_id:
@@ -995,7 +1454,7 @@ def query_recent_mails(since: str, limit: int = 30, mailbox_id: int = 0) -> list
 
 
 def count_recent_mails(since: str, mailbox_id: int = 0) -> int:
-    sql = "SELECT COUNT(*) AS n FROM mail_info WHERE received_at >= ? AND usefulness != 'spam'"
+    sql = "SELECT COUNT(*) AS n FROM mail_info WHERE received_at >= ? AND usefulness != 'spam' AND IFNULL(hidden,0)=0"
     params: list = [since]
     if mailbox_id:
         sql += " AND mailbox_id=?"
@@ -1040,7 +1499,7 @@ def query_mails_between(start: str, end: str) -> list[dict]:
             SELECT id, subject, sender, sender_email, content, received_at,
                    mail_type, todo_items, urgency, deadline, usefulness, parse_status
               FROM mail_info
-             WHERE received_at >= ? AND received_at <= ?
+             WHERE received_at >= ? AND received_at <= ? AND IFNULL(hidden,0)=0
              ORDER BY received_at ASC
             """,
             (start, end),
@@ -1088,6 +1547,7 @@ def insert_customer_task(
             new_id = int(cur.lastrowid)
         except sqlite3.IntegrityError:
             return None
+        conn.execute("UPDATE mail_info SET task_made=1 WHERE id=?", (source_mail_id,))
     return get_task(new_id)
 
 
@@ -1105,7 +1565,7 @@ def list_due_tasks(moment: str, limit: int = 5) -> list[dict]:
         rows = conn.execute(
             """
             SELECT * FROM customer_task
-             WHERE status='pending' AND execute_at != '' AND execute_at <= ?
+             WHERE status='pending' AND IFNULL(hidden,0)=0 AND execute_at != '' AND execute_at <= ?
              ORDER BY execute_at ASC
              LIMIT ?
             """,
@@ -1152,42 +1612,59 @@ def fail_task(task_id: int, error: str) -> None:
         )
 
 
-def dashboard_snapshot(mail_limit: int = 40, task_limit: int = 12) -> dict:
+def dashboard_snapshot(mail_limit: int = 40, task_limit: int = 60) -> dict:
     """演示界面用的轻量快照，不返回正文全文和密钥。"""
     with get_conn() as conn:
-        mail_count = int(conn.execute("SELECT COUNT(*) FROM mail_info").fetchone()[0])
+        mail_count = int(conn.execute("SELECT COUNT(*) FROM mail_info WHERE IFNULL(hidden,0)=0").fetchone()[0])
         useful_count = int(
-            conn.execute("SELECT COUNT(*) FROM mail_info WHERE usefulness='useful'").fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM mail_info WHERE usefulness='useful' AND IFNULL(hidden,0)=0").fetchone()[0]
         )
         spam_count = int(
-            conn.execute("SELECT COUNT(*) FROM mail_info WHERE usefulness='spam'").fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM mail_info WHERE usefulness='spam' AND IFNULL(hidden,0)=0").fetchone()[0]
         )
         pending = int(
             conn.execute(
-                "SELECT COUNT(*) FROM customer_task WHERE status='pending'"
+                "SELECT COUNT(*) FROM customer_task WHERE status='pending' AND IFNULL(hidden,0)=0"
             ).fetchone()[0]
         )
         drafts = int(
             conn.execute(
-                "SELECT COUNT(*) FROM customer_task WHERE status='draft'"
+                "SELECT COUNT(*) FROM customer_task WHERE status='draft' AND IFNULL(hidden,0)=0"
             ).fetchone()[0]
         )
         done = int(
             conn.execute(
-                "SELECT COUNT(*) FROM customer_task WHERE status='done'"
+                "SELECT COUNT(*) FROM customer_task WHERE status='done' AND IFNULL(hidden,0)=0"
             ).fetchone()[0]
         )
         mails = conn.execute(
-            _MAIL_CARD_SQL + " ORDER BY id DESC LIMIT ?",
+            _MAIL_CARD_SQL + " WHERE IFNULL(hidden,0)=0 ORDER BY id DESC LIMIT ?",
             (mail_limit,),
         ).fetchall()
         tasks = conn.execute(
             """
-            SELECT id, customer_name, execute_at, status, scope_rule, output_format, next_action,
-                   CASE WHEN status='draft' THEN substr(report, 1, 2000) ELSE substr(report, 1, 180) END AS report,
-                   last_error, created_at
-              FROM customer_task
-             ORDER BY CASE WHEN execute_at = '' THEN 1 ELSE 0 END, execute_at ASC, id ASC
+            SELECT t.id, t.customer_name, t.execute_at, t.status, t.scope_rule, t.output_format, t.next_action,
+                   CASE WHEN t.status='draft' THEN substr(t.report, 1, 2000) ELSE substr(t.report, 1, 400) END AS report,
+                   substr(IFNULL(m.todo_items, ''), 1, 200) AS recognition,
+                   t.last_error, t.created_at,
+                   CASE
+                     WHEN trim(IFNULL(t.reply_to, '')) != '' THEN 1
+                     WHEN instr(IFNULL(m.sender_email, ''), '@') > 0 THEN 1
+                     ELSE 0
+                   END AS can_reply,
+                   IFNULL(m.urgency, '') AS urgency,
+                   CASE
+                     WHEN trim(IFNULL(b.label, '')) != '' THEN substr(b.label, 1, 16)
+                     WHEN instr(IFNULL(b.address, ''), '@') > 1 THEN substr(b.address, 1, instr(b.address, '@') - 1)
+                     ELSE ''
+                   END AS box_name
+              FROM customer_task t
+              LEFT JOIN mail_info m ON m.id = t.source_mail_id
+              LEFT JOIN mailbox b ON b.id = m.mailbox_id
+             WHERE IFNULL(t.hidden,0)=0
+             ORDER BY CASE WHEN t.status = 'done' THEN 1 ELSE 0 END,
+                      CASE WHEN t.status = 'done' THEN t.executed_at END DESC,
+                      CASE WHEN t.execute_at = '' THEN 1 ELSE 0 END, t.execute_at ASC, t.id ASC
              LIMIT ?
             """,
             (task_limit,),
@@ -1204,29 +1681,51 @@ def dashboard_snapshot(mail_limit: int = 40, task_limit: int = 12) -> dict:
     }
 
 
-def list_recent_activity(since: str) -> dict:
-    """取某一天之后的邮件和任务，供运行记录按天归类。"""
+def list_recent_activity(since: str = "") -> dict:
+    """取运行记录要按天归类的邮件和任务。since 为空时不限起始日。"""
+    mail_where = "IFNULL(hidden,0)=0"
+    mail_args: list[str] = []
+    task_where = "IFNULL(t.hidden,0)=0"
+    task_args: list[str] = []
+    if since:
+        mail_where += " AND (substr(received_at, 1, 10) >= ? OR substr(created_at, 1, 10) >= ?)"
+        mail_args.extend((since, since))
+        task_where += """
+           AND (substr(t.created_at, 1, 10) >= ?
+             OR substr(t.executed_at, 1, 10) >= ?
+             OR substr(t.execute_at, 1, 10) >= ?)"""
+        task_args.extend((since, since, since))
     with get_conn() as conn:
         mails = conn.execute(
-            _MAIL_CARD_SQL
-            + """
-             WHERE substr(received_at, 1, 10) >= ? OR substr(created_at, 1, 10) >= ?
-             ORDER BY id DESC
-            """,
-            (since, since),
+            _MAIL_CARD_SQL + f" WHERE {mail_where} ORDER BY id DESC",
+            mail_args,
         ).fetchall()
         tasks = conn.execute(
-            """
-            SELECT id, customer_name, execute_at, status, scope_rule, output_format, created_at, executed_at,
-                   CASE WHEN status='draft' THEN substr(report, 1, 2000) ELSE substr(report, 1, 180) END AS report,
-                   substr(last_error, 1, 180) AS last_error
-              FROM customer_task
-             WHERE substr(created_at, 1, 10) >= ?
-                OR substr(executed_at, 1, 10) >= ?
-                OR substr(execute_at, 1, 10) >= ?
-             ORDER BY CASE WHEN execute_at = '' THEN 1 ELSE 0 END, execute_at ASC, id ASC
+            f"""
+            SELECT t.id, t.customer_name, t.execute_at, t.status, t.scope_rule, t.output_format,
+                   t.created_at, t.executed_at, t.source_mail_id,
+                   substr(IFNULL(m.received_at, ''), 1, 10) AS mail_day,
+                   CASE WHEN t.status='draft' THEN substr(t.report, 1, 2000) ELSE substr(t.report, 1, 400) END AS report,
+                   substr(IFNULL(m.todo_items, ''), 1, 200) AS recognition,
+                   substr(t.last_error, 1, 180) AS last_error,
+                   CASE
+                     WHEN trim(IFNULL(t.reply_to, '')) != '' THEN 1
+                     WHEN instr(IFNULL(m.sender_email, ''), '@') > 0 THEN 1
+                     ELSE 0
+                   END AS can_reply,
+                   IFNULL(m.urgency, '') AS urgency,
+                   CASE
+                     WHEN trim(IFNULL(b.label, '')) != '' THEN substr(b.label, 1, 16)
+                     WHEN instr(IFNULL(b.address, ''), '@') > 1 THEN substr(b.address, 1, instr(b.address, '@') - 1)
+                     ELSE ''
+                   END AS box_name
+              FROM customer_task t
+              LEFT JOIN mail_info m ON m.id = t.source_mail_id
+              LEFT JOIN mailbox b ON b.id = m.mailbox_id
+             WHERE {task_where}
+             ORDER BY CASE WHEN t.execute_at = '' THEN 1 ELSE 0 END, t.execute_at ASC, t.id ASC
             """,
-            (since, since, since),
+            task_args,
         ).fetchall()
     return {
         "mails": [_mask_card(row) for row in _rows(mails)],

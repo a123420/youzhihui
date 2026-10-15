@@ -28,7 +28,7 @@ DISCLAIMER = "【提示】以上内容由AI辅助生成，请人工复核后再�
 # 实训指定的系统提示词，保持原文，不在这里追加别的指令。
 SYSTEM_PARSE = """你是邮件分析助手，读取邮件内容，输出严格JSON，不要多余解释。
 区分两类邮件：
-1.普通业务邮件：提取待办事项、紧急等级【高/中/低】、截止时间。
+1.普通业务邮件：提取待办事项、紧急等级【高/中/低】、截止时间。待办写成一句能直接去做的话，写清做什么、什么时候，不要只抄主题。
 2.客户汇总指令邮件：提取：客户名称、execute_time(客户要求汇总执行时间)、scope_rule(整合范围)、output_format(输出格式)、next_action(完成后续操作)。
 如果是客户汇总任务，type="customer_task"；普通邮件type="normal_mail"。
 字段缺失填空字符串，输出纯JSON，不要markdown、不要额外文字。"""
@@ -77,6 +77,35 @@ def _normalize_proxy(value: str) -> str:
     return raw
 
 
+def _windows_proxy() -> str:
+    """系统代理。启动脚本把 NO_PROXY 设成 * 后，环境变量里就读不到它了。"""
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if not enabled:
+                return ""
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+    except OSError:
+        return ""
+    text = str(server or "").strip()
+    if "=" in text:
+        parts = {}
+        for item in text.split(";"):
+            if "=" not in item:
+                continue
+            name, value = item.split("=", 1)
+            parts[name.strip().lower()] = value.strip()
+        text = parts.get("https") or parts.get("http") or ""
+    return _normalize_proxy(text)
+
+
 def _proxy_url() -> str:
     for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
         found = _normalize_proxy(os.getenv(name, ""))
@@ -85,8 +114,9 @@ def _proxy_url() -> str:
     try:
         found = getproxies()
     except Exception:
-        return ""
-    return _normalize_proxy(found.get("https") or found.get("http") or "")
+        found = {}
+    chosen = _normalize_proxy(found.get("https") or found.get("http") or "")
+    return chosen or _windows_proxy()
 
 
 def _get_client() -> OpenAI:
@@ -96,7 +126,7 @@ def _get_client() -> OpenAI:
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
         if not api_key:
             raise RuntimeError("未配置 DEEPSEEK_API_KEY")
-        timeout = httpx.Timeout(40.0, connect=8.0)
+        timeout = httpx.Timeout(120.0, connect=10.0)
         proxy = _proxy_url()
         http_client = httpx.Client(proxy=proxy or None, timeout=timeout, trust_env=False)
         _client = OpenAI(
@@ -109,9 +139,53 @@ def _get_client() -> OpenAI:
     return _client
 
 
-def _link_error(exc: Exception) -> bool:
-    text = f"{type(exc).__name__} {exc}".lower()
-    return any(word in text for word in ("connect", "connection", "proxy", "ssl", "timeout", "timed out"))
+def _walk_errors(exc: Exception):
+    seen = []
+    current: BaseException | None = exc
+    while current is not None and current not in seen:
+        seen.append(current)
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _http_status(exc: Exception) -> int:
+    """接口返回的状态码。没有状态码时返回 0。"""
+    for item in _walk_errors(exc):
+        for attr in ("status_code", "status"):
+            code = getattr(item, attr, None)
+            if isinstance(code, int) and 100 <= code <= 599:
+                return code
+        response = getattr(item, "response", None)
+        code = getattr(response, "status_code", None)
+        if isinstance(code, int) and 100 <= code <= 599:
+            return code
+        matched = re.search(r"error code:\s*(\d{3})", str(item), re.IGNORECASE)
+        if matched:
+            return int(matched.group(1))
+    return 0
+
+
+def _connect_failure(exc: Exception) -> bool:
+    """连不上或证书失败。读响应超时不算，那种情况再试一次。"""
+    for item in _walk_errors(exc):
+        name = type(item).__name__.lower()
+        text = str(item).lower()
+        if "readtimeout" in name or "read operation timed out" in text:
+            return False
+        if any(word in name or word in text for word in ("connecttimeout", "connecterror", "proxyerror")):
+            return True
+        if "ssl" in name or "certificate" in text:
+            return True
+    return False
+
+
+def _slow_response(exc: Exception) -> bool:
+    for item in _walk_errors(exc):
+        name = type(item).__name__.lower()
+        text = str(item).lower()
+        if "readtimeout" in name or "read operation timed out" in text or "request timed out" in text:
+            return True
+    return False
 
 
 def _message_text(response) -> str:
@@ -133,16 +207,29 @@ def _message_text(response) -> str:
     return str(reasoning or "")
 
 
-def _chat(messages: list[dict], *, json_mode: bool, max_tokens: int, temperature: float) -> str:
+def _chat(
+    messages: list[dict],
+    *,
+    json_mode: bool,
+    max_tokens: int,
+    temperature: float,
+    timeout: httpx.Timeout | None = None,
+    tries: int = 4,
+) -> str:
     """关闭思考模式，让结果直接出现在 content 里。参数不被接受时自动降级重试。"""
     global _client
-    client = _get_client()
     model = os.getenv("DEEPSEEK_MODEL", "deepseek-flash").strip() or "deepseek-flash"
     use_json = json_mode
     disable_thinking = True
     last_error: Exception | None = None
+    slow_tries = 0
+    busy_tries = 0
+    saw_busy = False
 
-    for attempt in range(4):
+    for attempt in range(tries):
+        client = _get_client()
+        if timeout is not None:
+            client = client.with_options(timeout=timeout)
         kwargs = {
             "model": model,
             "messages": messages,
@@ -163,23 +250,47 @@ def _chat(messages: list[dict], *, json_mode: bool, max_tokens: int, temperature
             logger.warning("DeepSeek 返回空内容，准备重试（第 %s 次）", attempt + 1)
         except Exception as exc:
             last_error = exc
+            code = _http_status(exc)
             error_text = str(exc).lower()
-            if use_json and ("response_format" in error_text or "json_object" in error_text):
+            if use_json and code in {0, 400} and ("response_format" in error_text or "json_object" in error_text):
                 use_json = False
                 logger.warning("接口不接受 JSON 模式，改为普通文本后重试")
                 continue
-            if disable_thinking and "thinking" in error_text:
+            if disable_thinking and code in {0, 400, 422} and "thinking" in error_text:
                 disable_thinking = False
                 logger.warning("接口不接受 thinking 参数，去掉后重试")
                 continue
-            if _link_error(exc):
+            if code in {401, 403}:
+                logger.warning("DeepSeek 没有通过校验: %s", code)
+                _client = None
+                raise DeepSeekUnreachable("DeepSeek 没有通过校验。请检查本机配置后再试。") from exc
+            if code in {408, 409, 425, 429, 500, 502, 503, 504}:
+                busy_tries += 1
+                saw_busy = True
+                logger.warning("DeepSeek 暂时没有回应: %s", code)
+                _client = None
+                if busy_tries >= 2 or attempt + 1 >= tries:
+                    raise DeepSeekUnreachable("DeepSeek 这会儿没有回应，过一会儿再试。") from exc
+                continue
+            if _connect_failure(exc):
                 logger.warning("DeepSeek 连不上: %s", type(exc).__name__)
                 _client = None
-                raise DeepSeekUnreachable("连不上 DeepSeek。请检查网络或代理设置，再问一次。") from exc
-            logger.warning("DeepSeek 调用失败，准备重试: %s", type(exc).__name__)
-        if attempt == 3:
+                raise DeepSeekUnreachable("连不上 DeepSeek。请检查网络或代理后再试。") from exc
+            if _slow_response(exc):
+                slow_tries += 1
+                logger.warning("DeepSeek 响应太慢，准备重试: %s", type(exc).__name__)
+                _client = None
+                if slow_tries >= 2:
+                    break
+            else:
+                logger.warning("DeepSeek 调用失败，准备重试: %s", type(exc).__name__)
+        if attempt + 1 >= tries:
             break
-    raise RuntimeError(f"DeepSeek 调用失败: {last_error}")
+    if saw_busy:
+        raise DeepSeekUnreachable("DeepSeek 这会儿没有回应，过一会儿再试。") from last_error
+    if last_error and (_connect_failure(last_error) or _slow_response(last_error)):
+        raise DeepSeekUnreachable("连不上 DeepSeek。请检查网络或代理后再试。") from last_error
+    raise RuntimeError("DeepSeek 调用失败")
 
 
 def _load_json(text: str) -> dict:
@@ -365,12 +476,15 @@ def parse_email(subject: str, sender: str, content: str, received_at: str = "") 
         "execute_time 若能确定，使用北京时间，格式 YYYY-MM-DD HH:MM:SS。\n"
         + (f"这封邮件的收到时间是北京时间 {when}。正文里的今天、明天、几号都按这个时间推算年和月。\n" if when else "")
         + 
-        "urgency 只能是“高”“中”“低”或空字符串。\n"
+        "urgency 只能是“高”“中”“低”或空字符串。当天几点前就要交付的客户要求、设备告警、事故和安全问题填“高”；有明确时间但不在当天填“中”。\n"
+        "deadline 写正文里要求完成的时间，用 YYYY-MM-DD HH:MM:SS。写了「几点前」的，用这个截止时间，不要用事情发生的时间。「3号塔机」「2号楼」是编号，不是日期。\n"
+        "近3天、最近一周这类范围原样写进 scope_rule，不要改写成别的天数。\n"
         "type 只能是 customer_task 或 normal_mail。\n"
         "usefulness 只能是 useful、spam、ordinary。"
         "需要本人处理的账单、发票、截止事项或明确待办标 useful，并把要做的事写入 todo_items。"
         "需要本人去批准、拒绝或确认的权限变更、授权申请也标 useful，todo_items 写清要打开哪里、确认什么。"
         "座位安排、参会二维码也标 useful，todo_items 写明查看座位并保存参会码。"
+        "todo_items 必须是一句能直接去做的话，写清做什么、什么时候。时间能确定就写进这句话，不要只重复主题。\n"
         "当天来信写了几点要做什么，todo_items 写清这件事，type 仍用 normal_mail，不要当成客户汇总。"
         "验证码、已完成的登录通知，以及不必处理的安全提醒标 ordinary，不要标 spam。"
         "广告、促销、退订和无关营销标 spam。营销里的“紧急、限时”也标 spam，不要标 useful。"
@@ -470,6 +584,29 @@ def generate_summary(task: dict, mails: list[dict]) -> str:
     return _with_disclaimer(text)
 
 
+def answer_question(history: list[dict], summary: str) -> str:
+    """回答和改规则无关的问题。不返回调度动作。"""
+    system = (
+        "你是邮智汇的助手，只回答和修改收取规则无关的问题。\n"
+        "用一两句中文回答。不要说已经改了规则，不要说已经保存，不要输出 JSON。\n"
+        f"当前收取规则：{summary}"
+    )
+    messages = [{"role": "system", "content": system}]
+    for item in history[-8:]:
+        role = item.get("role")
+        content = str(item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content[:2000]})
+    return _chat(
+        messages,
+        json_mode=False,
+        max_tokens=400,
+        temperature=0.3,
+        timeout=httpx.Timeout(4.0, connect=2.0),
+        tries=1,
+    )
+
+
 def interpret_schedule(history: list[dict], summary: str) -> dict:
     """把操作员的对话收成调度 JSON。没提到的项目必须保持 keep。"""
     system = (
@@ -487,7 +624,7 @@ def interpret_schedule(history: list[dict], summary: str) -> dict:
         f"默认总结：每天 {os.getenv('DAILY_REPORT_HOUR', '21')}:{str(os.getenv('DAILY_REPORT_MINUTE', '0')).zfill(2)} 推送全天总结。\n"
         "只输出一个 JSON 对象，不要其他文字。字段如下：\n"
         '{"reply":"一两句中文。问建议时只给建议；要改规则时说明将要改成什么，不要说已经保存","poll_action":"keep","poll_minutes":0,'
-        '"poll_time":"","reply_action":"keep","report_action":"keep","report_time":""}\n'
+        '"poll_time":"","reply_action":"keep","report_action":"keep","report_time":"","fetch_action":"keep","fetch_limit":0}\n'
         "poll_action 只能是 keep、default、interval、daily、paused、once、now。\n"
         "now 表示马上收一次，不修改之后的拉取节奏，poll_minutes 和 poll_time 留空。\n"
         "interval 时 poll_minutes 取 1 到 1440。\n"
@@ -497,6 +634,8 @@ def interpret_schedule(history: list[dict], summary: str) -> dict:
         "reply_action 只能是 keep、default、always、never。\n"
         "always 表示汇总完成后准备回复，确认后再发。never 表示不准备回信。default 表示客户要求回复时也只出草稿。\n"
         "report_action 只能是 keep、default、daily。daily 时 report_time 用 HH:MM，表示每天这个时间推送全天总结。\n"
+        "fetch_action 只能是 keep、set、default。用户说每批 N 封时填 set，fetch_limit 取 5 到 40。没提到封数就填 keep，fetch_limit 填 0。恢复默认封数时填 default。\n"
+        "同一句话里如果同时改了拉取、封数、回复和总结，把提到的项目都填上，没提到的保持 keep。\n"
         "单封邮件正文里写的执行时间不要在这里改。"
     )
     messages = [{"role": "system", "content": system}]
@@ -505,7 +644,14 @@ def interpret_schedule(history: list[dict], summary: str) -> dict:
         content = str(item.get("content") or "").strip()
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content[:2000]})
-    raw = _chat(messages, json_mode=True, max_tokens=500, temperature=0.1)
+    raw = _chat(
+        messages,
+        json_mode=True,
+        max_tokens=500,
+        temperature=0.1,
+        timeout=httpx.Timeout(10.0, connect=5.0),
+        tries=1,
+    )
     data = _load_json(raw)
     logger.info(
         "调度对话 poll=%s reply=%s report=%s",

@@ -34,7 +34,9 @@ from db_init import (
     get_conn,
     get_mail,
     get_task,
-    history_uids,
+    stored_uids,
+    mails_ready_for_seen,
+    mark_seen_done,
     save_task_draft,
     init_db,
     insert_customer_task,
@@ -51,6 +53,7 @@ from db_init import (
     query_recent_mails,
     query_tasks_between,
     reset_running_tasks,
+    save_mail_files,
     update_mail_parse,
 )
 from llm_parser import DISCLAIMER, DeepSeekUnreachable, generate_daily_report, generate_summary, parse_email
@@ -226,25 +229,106 @@ def _date_with_day(today, day_num: int):
     return None
 
 
-def reminder_execute_at(subject: str, content: str, todo: str, received_at: str) -> str:
-    """当天来信里写了几点要做事，就排到那天的这个钟点。没有钟点则不排。"""
-    text = " ".join(part for part in (todo, subject, (content or "")[:240]) if part)
-    text = text.replace("：", ":")
+_NOT_A_DATE = re.compile(
+    r"^(?:塔机|塔吊|起重机|挖掘机|设备|楼|栋|车间|生产线|机组|机|柜|车|仓|泵|阀|门|道)"
+)
+
+
+def _calendar_day_number(text: str) -> int | None:
+    """「15号」是日期。「3号塔机」是设备编号，不能当成几号。"""
+    for match in re.finditer(r"(?<!\d)(\d{1,2})\s*号", text):
+        tail = text[match.end() :].lstrip()
+        if _NOT_A_DATE.match(tail):
+            continue
+        number = int(match.group(1))
+        if 1 <= number <= 31:
+            return number
+    return None
+
+
+def _clock_value(match: re.Match, text: str) -> tuple[int, int] | None:
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if minute > 59:
+        return None
+    span = text[max(0, match.start() - 4) : match.end()]
+    hour = _apply_day_period(span, hour)
+    if hour > 23:
+        return None
+    return hour, minute
+
+
+def _pick_clock(text: str) -> tuple[int, int] | None:
+    """「今天18点前」是要完成的时间，优先于告警发生的钟点。"""
+    deadline = re.search(
+        r"(?<!\d)(\d{1,2})\s*[:点时]\s*(\d{1,2})?\s*(?:分)?\s*(?:前|之前|以前)",
+        text,
+    )
+    if deadline:
+        picked = _clock_value(deadline, text)
+        if picked:
+            return picked
     clock = re.search(r"(?<!\d)(\d{1,2})\s*[:点时]\s*(\d{1,2})?(?!\d)", text)
     if not clock:
+        return None
+    return _clock_value(clock, text)
+
+
+_QUOTED_HEADER = re.compile(
+    r"^\s*(?:发送时间|发件时间|发送日期|日期|时间|sent|date|发件人|from|收件人|to|抄\s*送|cc|主\s*题|subject)\s*[:：].*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_quoted_headers(content: str) -> str:
+    """转发和引用里的「发送时间：…」是原信的时间，不是要做事的时间。"""
+    return _QUOTED_HEADER.sub(" ", content or "")
+
+
+_WEEKDAY = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6, "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5, "7": 6}
+
+
+def _weekday_date(text: str, anchor):
+    """「本周五」「下周一」「周三」按来信那天推算。"""
+    matched = re.search(r"(本周|这周|下周|下个星期|下星期|周|星期|礼拜)([一二三四五六日天1-7])", text)
+    if not matched:
+        return None
+    target = _WEEKDAY[matched.group(2)]
+    prefix = matched.group(1)
+    monday = anchor - timedelta(days=anchor.weekday())
+    if prefix.startswith("下"):
+        return monday + timedelta(days=7 + target)
+    day = monday + timedelta(days=target)
+    if prefix in ("周", "星期", "礼拜") and day < anchor:
+        day += timedelta(days=7)
+    return day
+
+
+def reminder_execute_at(
+    subject: str,
+    content: str,
+    todo: str,
+    received_at: str,
+    extra: str = "",
+) -> str:
+    """当天来信里写了几点要做事，就排到那天的这个钟点。没有钟点则不排。"""
+    exact = normalize_execute_time(extra, received_at) if extra else ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", exact or ""):
+        return exact
+    body = _strip_quoted_headers(content)
+    text = " ".join(part for part in (extra, todo, subject, body[:240]) if part)
+    text = text.replace("：", ":")
+    picked = _pick_clock(text)
+    if not picked:
         return ""
-    hour = int(clock.group(1))
-    minute = int(clock.group(2) or 0)
-    if minute > 59:
-        return ""
-    hour = _apply_day_period(text, hour)
-    if hour > 23:
-        return ""
+    hour, minute = picked
     today = datetime.now(CST).replace(tzinfo=None).date()
     anchor = _anchor_date(received_at) or today
-    day_mark = re.search(r"(?<!\d)(\d{1,2})\s*号", text)
-    if day_mark:
-        number = int(day_mark.group(1))
+    number = _calendar_day_number(text)
+    weekday = _weekday_date(text, anchor)
+    if weekday is not None:
+        day = weekday
+    elif number is not None:
         if anchor < today:
             try:
                 day = datetime(anchor.year, anchor.month, number).date()
@@ -267,6 +351,206 @@ def reminder_execute_at(subject: str, content: str, todo: str, received_at: str)
     except ValueError:
         return ""
     return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "半": 0}
+
+
+def _cn_number(text: str) -> int:
+    if text.isdigit():
+        return int(text)
+    if text == "十":
+        return 10
+    if text.startswith("十"):
+        return 10 + _CN_NUM.get(text[1:], 0)
+    if text.endswith("十"):
+        return _CN_NUM.get(text[:-1], 0) * 10
+    if "十" in text:
+        head, tail = text.split("十", 1)
+        return _CN_NUM.get(head, 0) * 10 + _CN_NUM.get(tail, 0)
+    return _CN_NUM.get(text, 0)
+
+
+def requested_lookback_days(text: str) -> int:
+    """客户写了「近3天」「最近一周」「近一个月」，就按这个范围汇总。没写返回 0。"""
+    raw = re.sub(r"\s+", "", text or "")
+    matched = re.search(r"(?:近|最近|过去|前)([0-9]{1,4}|[一两二三四五六七八九十]{1,3})(?:个)?(天|日|周|星期|礼拜|个月|月|年)", raw)
+    if matched:
+        number = _cn_number(matched.group(1))
+        unit = matched.group(2)
+        scale = {"天": 1, "日": 1, "周": 7, "星期": 7, "礼拜": 7, "个月": 30, "月": 30, "年": 365}[unit]
+        return max(0, min(number * scale, 3650))
+    if any(word in raw for word in ("今天的", "今日的", "当天的")):
+        return 1
+    if "本周" in raw or "这周" in raw:
+        return 7
+    if "本月" in raw or "这个月" in raw:
+        return 31
+    return 0
+
+
+def _importance(execute_at: str, received_at: str, output_format: str = "") -> str:
+    """模型没给紧急程度时补上：当天就要交的客户汇总算高，其余有时间的事项算中。"""
+    if not execute_at:
+        return ""
+    anchor = _anchor_date(received_at)
+    try:
+        due = datetime.strptime(execute_at[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return "中"
+    if output_format != "reminder" and anchor and (due - anchor).days <= 0:
+        return "高"
+    return "中"
+
+
+def _customer_todo(parsed: dict, execute_at: str, wants_reply: bool) -> str:
+    scope = (parsed.get("scope_rule") or "").strip()
+    if not scope:
+        return ""
+    when = f"{execute_at[:16]} 前" if execute_at else ""
+    shape = (parsed.get("output_format") or "").strip()
+    text = f"{when}汇总{scope}" + (f"，整理成{shape}" if shape else "")
+    if wants_reply:
+        text += "，并回复发件人"
+    return text[:200]
+
+
+def repair_mail_importance() -> int:
+    """给已入库、还没做完的事项补上截止时间和紧急程度。"""
+    from db_init import get_conn
+
+    changed = 0
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.id, m.urgency, m.deadline, m.received_at, t.execute_at, t.output_format
+              FROM mail_info m
+              JOIN customer_task t ON t.source_mail_id = m.id
+             WHERE t.status != 'done' AND t.execute_at != ''
+               AND (IFNULL(m.urgency, '') = '' OR IFNULL(m.deadline, '') = '')
+            """
+        ).fetchall()
+        for row in rows:
+            urgency = row["urgency"] or _importance(row["execute_at"], row["received_at"] or "", row["output_format"] or "")
+            reminder = (row["output_format"] or "") == "reminder"
+            deadline = row["deadline"] or ("" if reminder else row["execute_at"])
+            conn.execute(
+                "UPDATE mail_info SET urgency=?, deadline=? WHERE id=?",
+                (urgency, deadline, row["id"]),
+            )
+            changed += 1
+        tasks = conn.execute(
+            """
+            SELECT m.id, t.scope_rule, t.output_format, t.execute_at, t.reply_to
+              FROM mail_info m
+              JOIN customer_task t ON t.source_mail_id = m.id
+             WHERE m.mail_type = 'customer_task' AND IFNULL(m.todo_items, '') = ''
+            """
+        ).fetchall()
+        for row in tasks:
+            todo = _customer_todo(
+                {"scope_rule": row["scope_rule"], "output_format": row["output_format"]},
+                row["execute_at"] or "",
+                bool((row["reply_to"] or "").strip()),
+            )
+            if todo:
+                conn.execute("UPDATE mail_info SET todo_items=? WHERE id=?", (todo, row["id"]))
+                changed += 1
+    return changed
+
+
+def _reminder_note(moment: str, status: str) -> str:
+    if not moment:
+        return "信里没写时间，可以设个时间，或做完后点完成"
+    if status == "need_time":
+        return "时间已过，请确认是否还要执行"
+    return "到点提醒，不自动发信"
+
+
+def backfill_todo_tasks(days: int = 7) -> int:
+    """最近几天有用、有待办却没进任务的信，补成任务。更早的旧信不补。"""
+    from db_init import get_conn
+
+    since = (datetime.now(CST) - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.id, m.subject, m.content, m.todo_items, m.deadline, m.received_at, m.sender_email
+              FROM mail_info m
+             WHERE m.usefulness = 'useful' AND m.parse_status = 'ok'
+               AND trim(IFNULL(m.todo_items, '')) != ''
+               AND m.received_at >= ?
+               AND IFNULL(m.task_made, 0) = 0
+               AND NOT EXISTS (SELECT 1 FROM customer_task t WHERE t.source_mail_id = m.id)
+            """,
+            (since,),
+        ).fetchall()
+    added = 0
+    for row in rows:
+        action = (row["todo_items"] or "").strip()
+        moment = reminder_execute_at(
+            row["subject"] or "", row["content"] or "", action, row["received_at"] or "", row["deadline"] or ""
+        )
+        status = _status_for_time(moment)
+        sender = row["sender_email"] or ""
+        can_reply = _looks_like_email(sender)
+        task = insert_customer_task(
+            customer_name=action[:40],
+            execute_time=moment,
+            execute_at=moment,
+            scope_rule=action[:200],
+            output_format="reminder",
+            next_action=_reminder_note(moment, status),
+            source_mail_id=int(row["id"]),
+            reply_to=sender if can_reply else "",
+            reply_subject=_reply_subject(row["subject"] or "") if can_reply else "",
+            status=status,
+        )
+        if task:
+            added += 1
+    if added:
+        logger.info("最近 %s 天有待办的信已补进任务 %s 条", days, added)
+    return added
+
+
+def repair_open_reminders() -> int:
+    """改正还没执行的提醒：设备编号不再当成日期，截止时间优先。"""
+    from db_init import get_conn
+
+    changed = 0
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.id, t.execute_at, m.subject, m.content, m.todo_items, m.deadline, m.received_at
+              FROM customer_task t
+              JOIN mail_info m ON m.id = t.source_mail_id
+             WHERE t.output_format = 'reminder'
+               AND t.status IN ('pending', 'need_time')
+            """
+        ).fetchall()
+        for row in rows:
+            moment = reminder_execute_at(
+                row["subject"] or "",
+                row["content"] or "",
+                row["todo_items"] or "",
+                row["received_at"] or "",
+                row["deadline"] or "",
+            )
+            if not moment or moment == (row["execute_at"] or ""):
+                continue
+            status = _status_for_time(moment)
+            action = "时间已过，请确认是否还要执行" if status == "need_time" else "到点提醒，不自动发信"
+            conn.execute(
+                """
+                UPDATE customer_task
+                   SET execute_at=?, execute_time=?, status=?, next_action=?
+                 WHERE id=? AND status IN ('pending', 'need_time')
+                """,
+                (moment, moment, status, action, row["id"]),
+            )
+            changed += 1
+            logger.info("已更正事项时间 id=%s %s -> %s", row["id"], row["execute_at"], moment)
+    return changed
 
 
 def _reply_subject(subject: str) -> str:
@@ -362,6 +646,12 @@ def parse_saved_mail(mail_id: int) -> None:
             reply_subject=_reply_subject(row["subject"]) if wants_reply else "",
             status=_status_for_time(execute_at, _run_now(parsed.get("execute_time") or "")),
         )
+        if execute_at and not parsed.get("deadline"):
+            parsed["deadline"] = execute_at
+        if not parsed.get("urgency"):
+            parsed["urgency"] = _importance(execute_at, row.get("received_at") or "", parsed.get("output_format") or "")
+        if not parsed.get("todo_items"):
+            parsed["todo_items"] = _customer_todo(parsed, execute_at, wants_reply)
 
     update_mail_parse(
         mail_id,
@@ -383,33 +673,43 @@ def parse_saved_mail(mail_id: int) -> None:
             notify_new_task(task, row["subject"])
     elif parsed.get("usefulness") == "useful":
         moment = reminder_execute_at(
-            row["subject"], row["content"], parsed.get("todo_items", ""), row["received_at"]
+            row["subject"],
+            row["content"],
+            parsed.get("todo_items", ""),
+            row["received_at"],
+            parsed.get("deadline") or "",
         )
         action = (parsed.get("todo_items") or "").strip()
-        if moment and action:
+        if action:
             status = _status_for_time(moment)
+            sender = row["sender_email"]
+            can_reply = _looks_like_email(sender)
             task = insert_customer_task(
                 customer_name=action[:40],
                 execute_time=moment,
                 execute_at=moment,
                 scope_rule=action[:200],
                 output_format="reminder",
-                next_action="时间已过，请确认是否还要执行" if status == "need_time" else "到点提醒，不自动发信",
+                next_action=_reminder_note(moment, status),
                 source_mail_id=mail_id,
-                reply_to="",
-                reply_subject="",
+                reply_to=sender if can_reply else "",
+                reply_subject=_reply_subject(row["subject"]) if can_reply else "",
                 status=status,
             )
+            if task:
+                repair_mail_importance()
             if task and status == "pending":
                 logger.info("当天事项已排入任务 id=%s 时间=%s", task["id"], moment)
                 notify_reminder(task)
+            elif task and not moment:
+                logger.info("待办已放入待安排 id=%s", task["id"])
             elif task:
                 logger.info("当天事项时间已过，等待确认 id=%s 时间=%s", task["id"], moment)
     elif parsed["type"] != "customer_task":
         logger.info("普通邮件已解析 id=%s 待办=%s", mail_id, parsed["todo_items"] or "无")
 
 
-def ingest_mail(mail: dict, history: bool = False) -> int:
+def ingest_mail(mail: dict, history: bool = False) -> tuple[int, bool]:
     mail_id, created = insert_mail(
         message_id=mail["message_id"],
         subject=mail["subject"],
@@ -424,9 +724,47 @@ def ingest_mail(mail: dict, history: bool = False) -> int:
     )
     if created:
         logger.info("邮件已入库 id=%s 主题=%s", mail_id, mail["subject"])
+        try:
+            saved = save_mail_files(mail_id, mail.get("files") or [])
+            if saved:
+                logger.info("邮件附件已保存 id=%s %s 个", mail_id, saved)
+        except Exception:
+            logger.exception("邮件附件没有存下来 id=%s", mail_id)
     else:
         logger.info("邮件已存在，跳过重复入库 id=%s", mail_id)
-    return mail_id
+    return mail_id, created
+
+
+def backfill_mail_files(days: int = 7) -> int:
+    """最近几天的信回邮箱只读一遍附件，补存图片，并把识别出的文字接到正文后面。"""
+    from db_init import append_mail_ocr, mails_needing_files
+    from mail_client import attachment_ocr, keep_file, mail_attachments
+
+    since = (datetime.now(CST) - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
+    rows = mails_needing_files(since)
+    if not rows:
+        return 0
+    accounts = {int(a.get("id") or 0): a for a in mailbox_accounts()}
+    total = 0
+    for row in rows:
+        if should_stop():
+            break
+        account = accounts.get(int(row["mailbox_id"] or 0))
+        if not account:
+            continue
+        try:
+            found = mail_attachments(str(row["imap_uid"]), account)
+        except Exception:
+            logger.warning("补读附件失败 id=%s，下次启动再试", row["id"])
+            continue
+        current = get_mail(int(row["id"])) or {}
+        if found and "附件OCR识别开始" not in (current.get("content") or ""):
+            append_mail_ocr(int(row["id"]), attachment_ocr(found))
+        files = [{"name": n, "type": k, "data": d} for n, k, d in found if keep_file(k, d)]
+        total += save_mail_files(int(row["id"]), files)
+    if total:
+        logger.info("最近 %s 天的信已补存附件 %s 个", days, total)
+    return total
 
 
 def _poll_entry() -> None:
@@ -522,91 +860,146 @@ def first_scan_soon() -> None:
     )
 
 
-def job_poll_mail() -> None:
-    """每个已接入的邮箱各扫各的。新邮箱先收最近 40 封，再扫未读；扫完一批再看，还有未读才扫下一批。"""
+_poll_lock = threading.Lock()
+_seen_lock = threading.Lock()
+
+
+def settle_seen() -> None:
+    """识别完成的新信，同一邮箱一次标已读。首次回填的信不碰。"""
+    if not _seen_lock.acquire(blocking=False):
+        return
+    try:
+        rows = mails_ready_for_seen()
+        if not rows:
+            return
+        accounts = {int(item.get("id") or 0): item for item in mailbox_accounts()}
+        grouped: dict[int, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(int(row["mailbox_id"]), []).append(row)
+        for mailbox_id, items in grouped.items():
+            account = accounts.get(mailbox_id)
+            if not account:
+                continue
+            uids = [str(item["imap_uid"]) for item in items if item.get("imap_uid")]
+            try:
+                mark_seen(uids, account)
+            except Exception as exc:
+                logger.exception("标记已读失败")
+                notify_error("标记已读", exc)
+                continue
+            mark_seen_done([int(item["id"]) for item in items])
+    finally:
+        _seen_lock.release()
+
+
+def scan_now() -> str:
+    """页面上的「立即扫描」：马上同时看所有邮箱，之后的节奏不变。暂停拉取时也只收这一次。"""
     global _scan_note
-    from db_init import mailbox_accounts
+    if _scheduler is None or should_stop():
+        return "程序还没开始收信。请先接入邮箱。"
+    if not mailbox_accounts():
+        return "还没有接入邮箱。"
+    if _poll_lock.locked():
+        return "正在收信，这一轮收完就能看到。"
+    _scan_note = "正在连接邮箱"
+    threading.Thread(target=lambda: _guard("立即扫描", job_poll_mail), name="scan-now", daemon=True).start()
+    return "正在同时查看所有邮箱的未读。"
+
+
+def job_poll_mail() -> None:
+    """同一时间只收一轮。收完就放开，识别在后面进行，不挡住下一次扫描。"""
+    global _scan_note
+    if not _poll_lock.acquire(blocking=False):
+        logger.info("上一轮收信还没结束，这次跳过")
+        return
+    pulled = 0
+    try:
+        pulled = _poll_once()
+    finally:
+        _poll_lock.release()
+    if should_stop():
+        return
+    parsed = _parse_backlog()
+    settle_seen()
+    if should_stop():
+        return
+    if parsed:
+        if pulled:
+            _scan_note = f"未读已扫完，本次 {pulled} 封，并解析 {parsed} 封"
+        else:
+            _scan_note = f"没有新的未读邮件，并解析 {parsed} 封"
+
+
+def _scan_account(account: dict, batch: int) -> int:
+    """一个邮箱自己收自己的。新邮箱先收最近 40 封，再扫未读。"""
+    label = str(account.get("address") or "")
+    failures = _fetch_failures.setdefault(int(account.get("id") or 0), {})
+    pulled = 0
+    ceiling = 400
+    if not account.get("history_done"):
+        pulled += _pull_history(account, failures)
+    rounds = 0
+    while pulled < ceiling and not should_stop() and rounds < 40:
+        rounds += 1
+        try:
+            mails = fetch_unseen_mails(
+                limit=batch,
+                account=account,
+                failures=failures,
+                skip_uids=stored_uids(int(account.get("id") or 0)),
+            )
+        except Exception as exc:
+            logger.exception("拉取未读失败")
+            notify_error("拉取未读", exc)
+            break
+        if not mails:
+            break
+        fresh = 0
+        for mail in mails:
+            if should_stop():
+                break
+            try:
+                mail_id, created = ingest_mail(mail)
+                if created and not mail_from_history(mail_id):
+                    fresh += 1
+            except Exception as exc:
+                uid = str(mail.get("uid") or "")
+                failures[uid] = failures.get(uid, 0) + 1
+                logger.exception("邮件入库失败 uid=%s", uid)
+                notify_error("邮件入库", exc)
+        if not fresh:
+            logger.warning("本批没有新邮件，先停下，下一轮再试 %s", label)
+            break
+        pulled += fresh
+        if len(mails) < batch or should_stop():
+            break
+    return pulled
+
+
+def _poll_once() -> int:
+    """所有邮箱同时看未读。返回这次新入库的封数。"""
+    global _scan_note
     from operator_rule import active_fetch_limit
 
     batch = active_fetch_limit()
     accounts = mailbox_accounts()
+    _scan_note = "正在连接邮箱"
     pulled = 0
-    batches = 0
-    ceiling = 400
     try:
-        for account in accounts:
-            if pulled >= ceiling or should_stop():
-                break
-            label = str(account.get("address") or "")
-            failures = _fetch_failures.setdefault(int(account.get("id") or 0), {})
-            if not account.get("history_done"):
-                got = _pull_history(account, failures)
-                if got:
-                    batches += 1
-                    pulled += got
-            rounds = 0
-            while pulled < ceiling and not should_stop() and rounds < 40:
-                rounds += 1
-                try:
-                    mails = fetch_unseen_mails(
-                        limit=batch,
-                        account=account,
-                        failures=failures,
-                        skip_uids=history_uids(int(account.get("id") or 0)),
-                    )
-                except Exception as exc:
-                    logger.exception("拉取未读失败")
-                    notify_error("拉取未读", exc)
-                    if _scan_note.startswith("正在"):
-                        _scan_note = "拉取中断，下一轮会继续"
-                    break
-                if not mails:
-                    break
-                batches += 1
-                _scan_note = f"正在扫 {label} 第 {batches} 批" if label else f"正在扫第 {batches} 批"
-                seen_uids = []
-                for mail in mails:
-                    if should_stop():
-                        break
-                    try:
-                        mail_id = ingest_mail(mail)
-                        if not mail_from_history(mail_id):
-                            seen_uids.append(mail["uid"])
-                    except Exception as exc:
-                        uid = str(mail.get("uid") or "")
-                        failures[uid] = failures.get(uid, 0) + 1
-                        logger.exception("邮件入库失败 uid=%s", uid)
-                        notify_error("邮件入库", exc)
-                if not seen_uids:
-                    logger.warning("本批没有入库，先停下，下一轮再试")
-                    break
-                try:
-                    mark_seen(seen_uids, account)
-                except Exception as exc:
-                    logger.exception("标记已读失败")
-                    notify_error("标记已读", exc)
-                    break
-                pulled += len(seen_uids)
-                if len(mails) < batch or should_stop():
-                    break
-                _scan_note = f"{label} 这一批已扫完，还有未读，开始下一批" if label else "这一批已扫完，还有未读，开始下一批"
+        workers = max(1, min(4, len(accounts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_scan_account, account, batch) for account in accounts]
+            for future in as_completed(futures):
+                pulled += future.result()
         if pulled:
-            logger.info("扫完 %s 批，共 %s 封，每批 %s 封", batches, pulled, batch)
-            _scan_note = f"未读已扫完，本次 {batches} 批，共 {pulled} 封"
-        elif _scan_note.startswith("正在"):
-            _scan_note = ""
+            logger.info("未读已扫完，本次 %s 封", pulled)
+            _scan_note = f"未读已扫完，本次 {pulled} 封"
+        else:
+            _scan_note = "没有新的未读邮件"
     finally:
         if should_stop():
             _scan_note = ""
-
-    if should_stop():
-        return
-    parsed = _parse_backlog()
-    if parsed and not should_stop():
-        if pulled:
-            _scan_note = f"未读已扫完，并解析 {parsed} 封"
-        else:
-            _scan_note = f"已解析 {parsed} 封"
+    return pulled
 
 
 def _parse_one(mail_id: int) -> bool:
@@ -630,12 +1023,91 @@ def _parse_one(mail_id: int) -> bool:
     return False
 
 
+UPLOAD_KINDS = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".pdf": "application/pdf",
+}
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+_upload_lock = threading.Lock()
+
+
+def upload_kind(filename: str) -> str:
+    return UPLOAD_KINDS.get(Path(filename or "").suffix.lower(), "")
+
+
+def ingest_upload(filename: str, data: bytes) -> None:
+    """同时选了几份文件时一份一份识别，本地 OCR 不并发。"""
+    with _upload_lock:
+        _ingest_upload(filename, data)
+
+
+def _ingest_upload(filename: str, data: bytes) -> None:
+    """页面上传的扫描件：本地识别文字，归档成一条记录，有文字时再交给 DeepSeek 识别待办。"""
+    global _scan_note
+    import hashlib
+
+    from db_init import UPLOAD_DIR, insert_mail
+    from ocr_local import extract_attachment_text, invoice_brief
+
+    name = Path(filename or "").name[:120] or "扫描件"
+    suffix = Path(name).suffix.lower()
+    content_type = UPLOAD_KINDS.get(suffix, "")
+    if not content_type or not data or len(data) > MAX_UPLOAD_BYTES:
+        return
+    digest = hashlib.sha1(data).hexdigest()
+    stored = f"{digest}{suffix}"
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target = UPLOAD_DIR / stored
+    if not target.exists():
+        target.write_bytes(data)
+
+    _scan_note = f"正在识别 {name}"
+    try:
+        text = extract_attachment_text(name, content_type, data)
+    except Exception:
+        logger.exception("扫描件识别失败: %s", name)
+        text = ""
+    brief = invoice_brief(text) if text else ""
+    content = "\n\n".join(part for part in (brief, text) if part) or "（没有识别出文字）"
+    if len(content) > 80000:
+        content = content[:80000] + "\n...(正文过长已截断)"
+    mail_id, created = insert_mail(
+        message_id=f"upload:{digest}",
+        subject=name,
+        sender="本机上传",
+        sender_email="",
+        content=content,
+        received_at=now_str(),
+        source="upload",
+        file_name=stored,
+    )
+    if not created:
+        logger.info("扫描件已经上传过 id=%s", mail_id)
+        _scan_note = ""
+        return
+    logger.info("扫描件已归档 id=%s 识别 %s 字", mail_id, len(text))
+    if not text:
+        update_mail_parse(mail_id, "normal_mail", "", "", "", "ordinary", "ok", "", "没有识别出文字，原文件已归档")
+        _scan_note = ""
+        return
+    _scan_note = f"正在识别 {name} 里的待办"
+    _parse_one(mail_id)
+    _scan_note = ""
+
+
 def retry_parse(mail_id: int) -> bool:
     """页面上点「重新识别」：清掉失败次数，马上在后台再识别一次。"""
     if not reset_mail_parse(mail_id):
         return False
-    threading.Thread(target=_parse_one, args=(mail_id,), daemon=True, name=f"reparse-{mail_id}").start()
+    threading.Thread(target=_reparse_then_seen, args=(mail_id,), daemon=True, name=f"reparse-{mail_id}").start()
     return True
+
+
+def _reparse_then_seen(mail_id: int) -> None:
+    if _parse_one(mail_id):
+        settle_seen()
 
 
 def _parse_backlog() -> int:
@@ -664,6 +1136,69 @@ def _parse_backlog() -> int:
     return done
 
 
+_TOPIC_STOP = {
+    "邮件", "汇总", "所有", "全部", "最近", "过去", "今天", "今日", "当天", "本周", "这周", "本月", "这个月",
+    "天", "日", "周", "星期", "礼拜", "个月", "月", "年", "的", "了", "并", "以及", "和", "与", "或",
+    "在", "把", "将", "按", "对", "中", "内", "请", "要", "需要", "完成", "生成", "输出", "回复",
+    "客户", "范围", "关于", "本次", "一下", "进行", "整理", "清单", "通知", "内部", "来信",
+}
+
+
+def _topic_terms(text: str) -> list[str]:
+    """从客户写的范围里留下能用来对信的词。时间词和「邮件、汇总」不算。"""
+    raw = re.sub(r"(?:近|最近|过去|前)\s*[0-9一两二三四五六七八九十]{1,4}\s*(?:个)?(?:天|日|周|星期|礼拜|个月|月|年)", " ", text or "")
+    parts = re.split(r"[^\u4e00-\u9fffA-Za-z0-9]+", raw)
+    terms: list[str] = []
+    for part in parts:
+        piece = part.strip()
+        for stop in sorted(_TOPIC_STOP, key=len, reverse=True):
+            piece = piece.replace(stop, " ")
+        for word in piece.split():
+            if len(word) >= 2 and word not in _TOPIC_STOP and word not in terms:
+                terms.append(word)
+    return terms[:8]
+
+
+def _mail_hits(mail: dict, terms: list[str]) -> bool:
+    blob = " ".join(
+        [
+            str(mail.get("subject") or ""),
+            str(mail.get("todo_items") or ""),
+            str(mail.get("content") or "")[:800],
+        ]
+    ).lower()
+    return any(term.lower() in blob for term in terms)
+
+
+def _summary_mails(task: dict, since: str, mailbox_id: int) -> tuple[list[dict], str]:
+    """先按客户写的范围留下相关邮件，再最多取 30 封。对不上就不做成完整汇总。"""
+    pool = query_recent_mails(since, limit=400, mailbox_id=mailbox_id)
+    total = count_recent_mails(since, mailbox_id)
+    terms = _topic_terms(" ".join([task.get("scope_rule") or "", task.get("customer_name") or ""]))
+    scope = "这个邮箱" if mailbox_id else "已入库邮件"
+    if terms:
+        matched = [mail for mail in pool if _mail_hits(mail, terms)]
+        label = "、".join(terms[:4])
+        if not matched:
+            return [], f"{scope}在这段时间里没有对上「{label}」的邮件，本次未生成业务汇总。"
+        used = matched[:30]
+        if len(matched) > len(used):
+            note = f"{scope}在范围内有 {total} 封非垃圾邮件，对上「{label}」的有 {len(matched)} 封，本次看了最近 {len(used)} 封。"
+        else:
+            note = f"{scope}在范围内有 {total} 封非垃圾邮件，对上「{label}」的有 {len(matched)} 封，本次全部看过。"
+        if total > len(pool):
+            note += f"查找时先看了最近 {len(pool)} 封。"
+        return list(reversed(used)), note
+    used = pool[:30]
+    if not used:
+        return [], ""
+    if total > len(used):
+        note = f"{scope}在范围内有 {total} 封非垃圾邮件，本次只看了最近 {len(used)} 封。"
+    else:
+        note = ""
+    return list(reversed(used)), note
+
+
 def _execute_task(task: dict) -> None:
     if (task.get("output_format") or "") == "reminder":
         text = (task.get("scope_rule") or task.get("customer_name") or "当天事项").strip()
@@ -673,21 +1208,23 @@ def _execute_task(task: dict) -> None:
         logger.info("当天事项已提醒 id=%s", task["id"])
         return
 
-    lookback_days = _int_env("SUMMARY_LOOKBACK_DAYS", 30, 1, 3650)
+    asked_days = requested_lookback_days(
+        " ".join([task.get("scope_rule") or "", task.get("customer_name") or "", task.get("next_action") or ""])
+    )
+    lookback_days = asked_days or _int_env("SUMMARY_LOOKBACK_DAYS", 30, 1, 3650)
     since = (datetime.now(CST) - timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
     source = get_mail(int(task.get("source_mail_id") or 0)) if task.get("source_mail_id") else None
     mailbox_id = int((source or {}).get("mailbox_id") or 0)
-    mails = list(reversed(query_recent_mails(since, limit=30, mailbox_id=mailbox_id)))
-    total = count_recent_mails(since, mailbox_id)
+    mails, scope_note = _summary_mails(task, since, mailbox_id)
     if not mails:
-        report = (
-            f"最近 {lookback_days} 天没有检索到历史邮件，本次未生成业务汇总。\n\n{DISCLAIMER}"
-        )
+        report = scope_note or f"最近 {lookback_days} 天没有检索到历史邮件，本次未生成业务汇总。"
+        report = f"{report}\n\n{DISCLAIMER}"
     else:
         report = generate_summary(task, mails)
-        if total > len(mails):
-            scope = "这个邮箱" if mailbox_id else "已入库邮件"
-            report = f"{scope}在范围内有 {total} 封非垃圾邮件，本次只看了最近 {len(mails)} 封。\n\n{report}"
+        if scope_note:
+            report = f"{scope_note}\n\n{report}"
+        if asked_days:
+            report = f"按来信要求，只汇总最近 {lookback_days} 天（{since[:16]} 之后）的邮件。\n\n{report}"
 
     reply_text = " ".join(
         [
@@ -937,6 +1474,9 @@ def start_scheduler() -> None:
     if recovered:
         logger.info("已恢复 %s 条中断的汇总任务", recovered)
     promote_pending_replies()
+    repair_open_reminders()
+    backfill_todo_tasks()
+    repair_mail_importance()
 
     poll_minutes = _int_env("MAIL_POLL_MINUTES", 5, 1, 24 * 60)
     scan_seconds = _int_env("TASK_SCAN_SECONDS", 60, 15, 24 * 60 * 60)
@@ -979,6 +1519,11 @@ def start_scheduler() -> None:
     reschedule_from_rule(immediate=True)
     scheduler.start()
     _log_startup(poll_minutes, scan_seconds, daily_hour, daily_minute)
+    threading.Thread(
+        target=lambda: _guard("补存附件", backfill_mail_files),
+        name="mail-files",
+        daemon=True,
+    ).start()
     try:
         while not _stop.wait(1):
             pass
